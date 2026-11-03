@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { X, QrCode, Camera, CheckCircle2, ShieldCheck } from 'lucide-react';
+import { X, QrCode, Camera, ShieldCheck, CheckCircle2 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { AppSettings, NearbyDevice } from '../types';
+import { TransferManager } from '../services/TransferManager';
 import { translations } from '../i18n';
 
 interface QrCodeModalProps {
@@ -21,26 +22,12 @@ export const QrCodeModal: React.FC<QrCodeModalProps> = ({
 }) => {
   const t = translations[settings.language];
   const [mode, setMode] = useState<'send' | 'receive'>(initialMode);
-  const [scanResult, setScanResult] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
-  const sessionCode = `kaydoshare://session?device=${encodeURIComponent(settings.deviceName)}&id=kaydo_${Math.random().toString(36).substring(7)}`;
-
-  const handleSimulateScan = () => {
-    setScanResult("KAYDO-Galaxy-S24");
-    setTimeout(() => {
-      onConnectSuccess({
-        id: 'scanned_dev',
-        name: 'KAYDO-Galaxy-S24',
-        model: 'Samsung Galaxy S24 Ultra',
-        os: 'Android',
-        rssi: -35,
-        avatarColor: 'bg-blue-600'
-      });
-      onClose();
-    }, 1200);
-  };
+  const manager = TransferManager.getInstance();
+  const localDevice = manager.getLocalDevice();
+  const sessionCode = `kaydoshare://session?device=${encodeURIComponent(localDevice.name)}&id=${localDevice.id}&pin=${manager.getSecurityPin()}`;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md">
@@ -99,41 +86,25 @@ export const QrCodeModal: React.FC<QrCodeModalProps> = ({
             </div>
             <div className="text-center space-y-1">
               <p className="text-sm font-bold text-white">{settings.deviceName}</p>
-              <p className="text-xs text-slate-400">Demandez à l'autre appareil de scanner ce code pour se connecter instantanément.</p>
+              <p className="text-xs text-slate-400">Scannez ce code depuis un autre appareil pour établir le canal P2P direct.</p>
             </div>
           </div>
         ) : (
           <div className="flex flex-col items-center space-y-4 py-4">
-            <div className="relative w-full h-64 bg-slate-950 border-2 border-dashed border-slate-700 rounded-3xl flex flex-col items-center justify-center p-6 space-y-3 overflow-hidden">
-              {scanResult ? (
-                <div className="flex flex-col items-center space-y-2 text-emerald-400 animate-fade-in">
-                  <CheckCircle2 className="w-12 h-12" />
-                  <p className="font-bold text-white">Appareil détecté : {scanResult}</p>
-                  <p className="text-xs text-slate-400">Établissement du canal sécurisé...</p>
-                </div>
-              ) : (
-                <>
-                  <div className="w-16 h-16 rounded-2xl bg-violet-500/10 border border-violet-500/30 flex items-center justify-center text-violet-400 animate-pulse">
-                    <Camera className="w-8 h-8" />
-                  </div>
-                  <p className="text-xs text-slate-400 text-center">
-                    Pointez la caméra vers le QR code de l'appareil émetteur ou récepteur.
-                  </p>
-                  <button
-                    onClick={handleSimulateScan}
-                    className="px-4 py-2 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-xs font-bold shadow-lg transition-all"
-                  >
-                    Simuler un scan réussi
-                  </button>
-                </>
-              )}
+            <div className="relative w-full h-56 bg-slate-950 border-2 border-dashed border-slate-700 rounded-3xl flex flex-col items-center justify-center p-6 space-y-3">
+              <div className="w-16 h-16 rounded-2xl bg-violet-500/10 border border-violet-500/30 flex items-center justify-center text-violet-400 animate-pulse">
+                <Camera className="w-8 h-8" />
+              </div>
+              <p className="text-xs text-slate-400 text-center">
+                Pointez la caméra vers le QR code de l'appareil distant pour synchroniser la session hors-ligne.
+              </p>
             </div>
           </div>
         )}
 
         <div className="flex items-center space-x-2 text-[11px] text-slate-400 bg-slate-950 p-3 rounded-2xl border border-slate-800">
           <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-          <span>Chiffrement direct P2P de bout en bout sans passer par un serveur cloud.</span>
+          <span>Sécurité cryptographique sans serveur central ni Internet.</span>
         </div>
 
       </div>
