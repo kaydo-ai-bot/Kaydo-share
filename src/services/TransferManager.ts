@@ -19,6 +19,7 @@ import {
   encodeChunkFrame,
   decodeChunkFrame,
   calculateSha256,
+  calculateBlobSha256,
   KaydoMessageType,
   KAYDO_MAGIC
 } from './KaydoProtocol';
@@ -55,6 +56,7 @@ export class TransferManager {
   private peerConnection: RTCPeerConnection | null = null;
   private dataChannel: RTCDataChannel | null = null;
   private isInitiator: boolean = false;
+  private pendingIceCandidates: RTCIceCandidateInit[] = [];
 
   private heartbeatTimer: number | null = null;
   private signalPollTimer: number | null = null;
@@ -191,6 +193,7 @@ export class TransferManager {
 
   private async createPeerConnection() {
     this.cleanupRtc();
+    this.pendingIceCandidates = [];
     this.peerConnection = new RTCPeerConnection(RTC_CONFIG);
 
     this.peerConnection.onicecandidate = (event) => {
@@ -235,10 +238,16 @@ export class TransferManager {
 
     this.dataChannel.onerror = (err) => {
       console.warn("RTCDataChannel error:", err);
+      this.listener?.onError?.("Erreur sur le canal de données direct WebRTC.");
+    };
+
+    this.dataChannel.onclose = () => {
+      this.state = 'disconnected';
     };
   }
 
   private async initiateWebRtcConnection() {
+    this.pendingIceCandidates = [];
     await this.createPeerConnection();
     if (!this.peerConnection) return;
 
@@ -251,7 +260,7 @@ export class TransferManager {
     const offer = await this.peerConnection.createOffer();
     await this.peerConnection.setLocalDescription(offer);
 
-    this.sendSignal('WEBRTC_SIGNAL', { sdp: offer });
+    await this.sendSignal('WEBRTC_SIGNAL', { sdp: offer });
   }
 
   private async handleWebRtcSignal(payload: any) {
@@ -263,30 +272,68 @@ export class TransferManager {
 
       await this.peerConnection.setRemoteDescription(new RTCSessionDescription(payload.sdp));
 
+      // Flush queued candidates once remote description is set
+      for (const cand of this.pendingIceCandidates) {
+        try {
+          await this.peerConnection.addIceCandidate(new RTCIceCandidate(cand));
+        } catch (e) {
+          console.warn("Erreur ajout candidat ICE différé:", e);
+        }
+      }
+      this.pendingIceCandidates = [];
+
       if (payload.sdp.type === 'offer') {
         const answer = await this.peerConnection.createAnswer();
         await this.peerConnection.setLocalDescription(answer);
-        this.sendSignal('WEBRTC_SIGNAL', { sdp: answer });
+        await this.sendSignal('WEBRTC_SIGNAL', { sdp: answer });
       }
     } else if (payload.candidate) {
       if (this.peerConnection && this.peerConnection.remoteDescription) {
-        await this.peerConnection.addIceCandidate(new RTCIceCandidate(payload.candidate));
+        try {
+          await this.peerConnection.addIceCandidate(new RTCIceCandidate(payload.candidate));
+        } catch (e) {
+          console.warn("Erreur ajout candidat ICE:", e);
+        }
+      } else {
+        this.pendingIceCandidates.push(payload.candidate);
       }
     }
   }
 
-  private sendSignal(type: any, payload: any) {
-    if (!this.connectedPeer) return;
-    fetch('/api/signal/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        fromId: this.localDevice.id,
-        toId: this.connectedPeer.id,
-        type,
-        payload
-      })
-    }).catch(() => {});
+  /**
+   * Sends signaling envelope to local signaling service.
+   * STRICT: Verifies every HTTP response and cancels the transfer on error.
+   */
+  private async sendSignal(type: any, payload: any): Promise<boolean> {
+    if (!this.connectedPeer) return false;
+    try {
+      const res = await fetch('/api/signal/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fromId: this.localDevice.id,
+          toId: this.connectedPeer.id,
+          type,
+          payload
+        })
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({ error: res.statusText }));
+        const msg = `Erreur HTTP de signalisation ${res.status}: ${errorData.error || res.statusText}`;
+        console.error(msg);
+        this.listener?.onError?.(msg);
+        this.cancelTransfer();
+        return false;
+      }
+      return true;
+    } catch (err: any) {
+      const msg = `Erreur réseau de signalisation: ${err.message || 'Serveur de signalisation injoignable'}`;
+      console.error(msg);
+      this.listener?.onError?.(msg);
+      this.cancelTransfer();
+      return false;
+    }
   }
 
   /**
@@ -392,7 +439,7 @@ export class TransferManager {
             fileSize: assembly.manifest.fileSize,
             transferredBytes: assembly.bytesReceived,
             speedMBs: 0,
-            progress: 100,
+            progress: Math.min(99, assembly.getProgressPercentage()),
             status: 'error',
             direction: 'receive',
             peerName: this.connectedPeer?.name || 'Émetteur',
@@ -548,9 +595,8 @@ export class TransferManager {
       const totalSize = file.size;
       const totalChunks = Math.ceil(totalSize / chunkSize);
 
-      // Compute actual SHA-256 before sending
-      const wholeBuffer = await file.blob.arrayBuffer();
-      const expectedSha256 = await calculateSha256(wholeBuffer);
+      // Compute actual SHA-256 via streaming without loading entire file in memory (OOM proof)
+      const expectedSha256 = await calculateBlobSha256(file.blob);
 
       const manifest: FileManifest = {
         fileId: file.id,
@@ -593,8 +639,8 @@ export class TransferManager {
         );
 
         // Flow control: wait if RTCDataChannel buffer is full
-        if (this.dataChannel.bufferedAmount > 4 * 1024 * 1024) {
-          await new Promise(r => setTimeout(r, 50));
+        while (this.dataChannel.bufferedAmount > 2 * 1024 * 1024 && !this.isCancelled) {
+          await new Promise(r => setTimeout(r, 20));
         }
 
         this.dataChannel.send(chunkFrame);
@@ -602,7 +648,8 @@ export class TransferManager {
 
         const elapsedSeconds = (performance.now() - startTime) / 1000;
         const speedMBs = elapsedSeconds > 0 ? (bytesSent / (1024 * 1024)) / elapsedSeconds : 0;
-        const progress = Math.min(100, Math.floor((bytesSent / totalSize) * 100));
+        // Never report 100% until complete transfer verification
+        const progress = Math.min(99, Math.floor((bytesSent / totalSize) * 100));
 
         onProgress({
           id: file.id,

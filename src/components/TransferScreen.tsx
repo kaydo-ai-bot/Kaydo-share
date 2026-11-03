@@ -72,6 +72,10 @@ export const TransferScreen: React.FC<TransferScreenProps> = ({
           } catch (e) {
             // fallback to manual download button
           }
+        },
+        onError: (err: string) => {
+          setStatus('error');
+          setErrorMessage(err);
         }
       });
     }

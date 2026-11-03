@@ -20,7 +20,7 @@ interface SignalEnvelope {
   id: string;
   fromId: string;
   toId: string;
-  type: 'CONNECT_REQUEST' | 'CONNECT_ACCEPT' | 'CONNECT_REJECT' | 'WEBRTC_SIGNAL';
+  type: 'CONNECT_REQUEST' | 'CONNECT_ACCEPT' | 'CONNECT_REJECT' | 'WEBRTC_SIGNAL' | 'TRANSFER_CANCEL';
   payload: any;
   timestamp: number;
 }

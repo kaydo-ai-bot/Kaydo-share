@@ -175,4 +175,33 @@ describe('KAYDO Protocol - Binary Framing & Verification Suite', () => {
     await expect(assembly.finalize()).rejects.toThrow(ChecksumMismatchError);
   });
 
+  it('Sha256Incremental calculates identical hash to Web Crypto API across multiple chunk feeds', async () => {
+    const { Sha256Incremental, calculateBlobSha256 } = await import('../KaydoProtocol');
+
+    // Create 100 KB test payload
+    const testBytes = new Uint8Array(100 * 1024);
+    for (let i = 0; i < testBytes.length; i++) {
+      testBytes[i] = (i * 7 + 13) & 0xff;
+    }
+
+    const expectedHash = await calculateSha256(testBytes.buffer);
+
+    // Feed in 7-byte irregular slices to test internal 64-byte block boundary logic
+    const incremental = new Sha256Incremental();
+    const sliceSize = 777;
+    for (let offset = 0; offset < testBytes.length; offset += sliceSize) {
+      const slice = testBytes.subarray(offset, Math.min(testBytes.length, offset + sliceSize));
+      incremental.update(slice);
+    }
+    const actualHash = incremental.digest();
+
+    expect(actualHash).toBe(expectedHash);
+
+    // Test calculateBlobSha256
+    const blob = new Blob([testBytes]);
+    const blobHash = await calculateBlobSha256(blob);
+    expect(blobHash).toBe(expectedHash);
+  });
+
 });
+
