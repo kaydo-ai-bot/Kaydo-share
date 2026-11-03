@@ -135,6 +135,8 @@ export default function App() {
             startTransferWithDevice={(dev) => {
               setConnectedPeerName(dev.name);
               setIsConnected(true);
+              setTransferDirection('receive');
+              setCurrentView('transfer');
             }}
           />
         )}
@@ -207,6 +209,10 @@ export default function App() {
         onConnectSuccess={(dev) => {
           handleConnectDevice(dev);
           if (qrMode === 'receive') {
+            setTransferDirection('receive');
+            setCurrentView('transfer');
+          } else {
+            setTransferDirection('send');
             setCurrentView('send');
           }
         }}

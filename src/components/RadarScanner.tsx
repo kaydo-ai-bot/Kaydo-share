@@ -61,6 +61,7 @@ export const RadarScanner: React.FC<RadarScannerProps> = ({
       const manager = TransferManager.getInstance();
       manager.acceptConnection(incomingRequest.device);
       onConnect(incomingRequest.device);
+      startTransferWithDevice(incomingRequest.device);
       setIncomingRequest(null);
     }
   };

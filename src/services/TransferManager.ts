@@ -1,11 +1,8 @@
 /**
  * TransferManager.ts
- * Real Peer-to-Peer file sharing engine with Zero Simulation.
- * - Discovers real active peers running KAYDO SHARE on the same device/network.
- * - Streams actual binary chunks of user files.
- * - Computes real cryptographic SHA-256 hashes.
- * - Measures authentic transfer speed and progress.
- * - Never invents fake devices, fake connection requests, or mock data.
+ * Real Cross-Device Peer-to-Peer Transfer Engine.
+ * Supports discovery & connection across distinct physical phones, tablets and PCs.
+ * Uses HTTP polling signaling relay (/api/discovery and /api/signal) + BroadcastChannel for same-device tabs.
  */
 
 import { KaydoFile, NearbyDevice, TransferTask } from '../types';
@@ -25,18 +22,17 @@ export interface TransferListener {
 export class TransferManager {
   private static instance: TransferManager;
   private state: ConnectionState = 'disconnected';
-  private discoveryChannel: BroadcastChannel;
-  private dataChannel: BroadcastChannel;
   private listener: TransferListener | null = null;
   private localDevice: NearbyDevice;
-  private discoveredPeers: Map<string, { device: NearbyDevice; lastSeen: number }> = new Map();
+  private discoveredPeers: Map<string, NearbyDevice> = new Map();
   private connectedPeer: NearbyDevice | null = null;
   private currentPin: string = '';
-  private isAdvertiser: boolean = false;
-  private heartbeatTimer: number | null = null;
-  private cleanupTimer: number | null = null;
 
-  // Active incoming file transfer assembly buffer
+  private heartbeatTimer: number | null = null;
+  private signalPollTimer: number | null = null;
+  private peerPollTimer: number | null = null;
+
+  // Assembly buffer for incoming files
   private incomingFileMeta: {
     id: string;
     name: string;
@@ -44,35 +40,41 @@ export class TransferManager {
     type: string;
     checksum: string;
     totalChunks: number;
-    receivedChunks: ArrayBuffer[];
+    receivedChunks: BlobPart[];
     bytesReceived: number;
     startTime: number;
   } | null = null;
 
   private constructor() {
-    // Generate persistent or unique device ID
     let deviceId = localStorage.getItem('kaydo_device_id');
     if (!deviceId) {
-      deviceId = `dev_${Math.random().toString(36).substring(2, 9)}`;
+      deviceId = `dev_${Math.random().toString(36).substring(2, 8)}`;
       localStorage.setItem('kaydo_device_id', deviceId);
     }
 
-    let deviceName = localStorage.getItem('kaydo_device_name') || `KAYDO-${Math.floor(100 + Math.random() * 900)}`;
+    let deviceName = localStorage.getItem('kaydo_device_name');
+    if (!deviceName) {
+      const isMobile = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+      const isAndroid = /Android/i.test(navigator.userAgent);
+      const isIOS = /iPhone|iPad/i.test(navigator.userAgent);
+      const prefix = isAndroid ? 'KAYDO-Android' : isIOS ? 'KAYDO-iPhone' : 'KAYDO-PC';
+      deviceName = `${prefix}-${Math.floor(100 + Math.random() * 900)}`;
+      localStorage.setItem('kaydo_device_name', deviceName);
+    }
 
-    const isMobile = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+    const isAndroid = /Android/i.test(navigator.userAgent);
+    const isIOS = /iPhone|iPad/i.test(navigator.userAgent);
 
     this.localDevice = {
       id: deviceId,
       name: deviceName,
-      model: isMobile ? (navigator.userAgent.includes('Android') ? 'Appareil Android' : 'Appareil iOS') : 'Navigateur PC/Mac',
-      os: isMobile ? (navigator.userAgent.includes('Android') ? 'Android' : 'iOS') : 'Windows',
-      rssi: -40,
+      model: isAndroid ? 'Téléphone Android' : isIOS ? 'iPhone iOS' : 'Ordinateur',
+      os: isAndroid ? 'Android' : isIOS ? 'iOS' : 'Windows',
+      rssi: -45,
       avatarColor: 'bg-blue-600'
     };
 
-    this.discoveryChannel = new BroadcastChannel('kaydo_share_p2p_discovery_v3');
-    this.dataChannel = new BroadcastChannel('kaydo_share_p2p_data_v3');
-    this.setupChannels();
+    this.startGlobalSignaling();
   }
 
   public static getInstance(): TransferManager {
@@ -85,6 +87,7 @@ export class TransferManager {
   public setLocalDeviceName(name: string) {
     this.localDevice.name = name;
     localStorage.setItem('kaydo_device_name', name);
+    this.sendHeartbeat();
   }
 
   public getLocalDevice(): NearbyDevice {
@@ -95,217 +98,226 @@ export class TransferManager {
     this.listener = listener;
   }
 
-  private setupChannels() {
-    this.discoveryChannel.onmessage = (event) => {
-      const data = event.data;
-      if (!data || !data.type) return;
+  private startGlobalSignaling() {
+    // Send immediate heartbeat
+    this.sendHeartbeat();
 
-      const { type, sender, targetId, pin } = data;
+    // Heartbeat every 2.5 seconds so other phones always see us online
+    this.heartbeatTimer = window.setInterval(() => {
+      this.sendHeartbeat();
+    }, 2500);
 
-      // Ignore messages from self
-      if (sender && sender.id === this.localDevice.id) return;
-
-      if (type === 'PING') {
-        // A peer is announcing their presence
-        this.discoveredPeers.set(sender.id, { device: sender, lastSeen: Date.now() });
-        this.notifyPeers();
-
-        // Reply with PONG so the new peer discovers us immediately
-        this.discoveryChannel.postMessage({
-          type: 'PONG',
-          sender: this.localDevice
-        });
-      } else if (type === 'PONG') {
-        this.discoveredPeers.set(sender.id, { device: sender, lastSeen: Date.now() });
-        this.notifyPeers();
-      } else if (type === 'CONNECT_REQUEST' && targetId === this.localDevice.id) {
-        // Genuine connection request from a real peer
-        this.connectedPeer = sender;
-        this.currentPin = pin;
-        this.listener?.onIncomingConnectionRequest?.(sender, pin);
-      } else if (type === 'CONNECT_ACCEPT' && targetId === this.localDevice.id) {
-        // Our request was accepted by the remote peer
-        this.connectedPeer = sender;
-        this.state = 'connected';
-        this.listener?.onConnectionEstablished?.(sender, this.currentPin);
-      } else if (type === 'CONNECT_REJECT' && targetId === this.localDevice.id) {
-        this.connectedPeer = null;
-        this.state = 'disconnected';
-        this.listener?.onConnectionRejected?.();
-      } else if (type === 'DISCONNECT' && targetId === this.localDevice.id) {
-        this.connectedPeer = null;
-        this.state = 'disconnected';
-      }
-    };
-
-    this.dataChannel.onmessage = async (event) => {
-      const data = event.data;
-      if (!data || !data.type) return;
-
-      if (data.type === 'START_FILE') {
-        this.incomingFileMeta = {
-          id: data.id,
-          name: data.name,
-          size: data.size,
-          type: data.mimeType,
-          checksum: data.checksum,
-          totalChunks: data.totalChunks,
-          receivedChunks: [],
-          bytesReceived: 0,
-          startTime: Date.now()
-        };
-      } else if (data.type === 'FILE_CHUNK' && this.incomingFileMeta && this.incomingFileMeta.id === data.id) {
-        const chunkBuffer: ArrayBuffer = data.chunk;
-        this.incomingFileMeta.receivedChunks.push(chunkBuffer);
-        this.incomingFileMeta.bytesReceived += chunkBuffer.byteLength;
-
-        const elapsed = (Date.now() - this.incomingFileMeta.startTime) / 1000;
-        const speedMBs = elapsed > 0 ? (this.incomingFileMeta.bytesReceived / (1024 * 1024)) / elapsed : 0;
-        const progress = Math.min(100, Math.floor((this.incomingFileMeta.bytesReceived / this.incomingFileMeta.size) * 100));
-
-        this.listener?.onTransferProgress?.({
-          id: this.incomingFileMeta.id,
-          fileName: this.incomingFileMeta.name,
-          fileSize: this.incomingFileMeta.size,
-          transferredBytes: this.incomingFileMeta.bytesReceived,
-          speedMBs: parseFloat(speedMBs.toFixed(2)),
-          progress,
-          status: 'transferring',
-          direction: 'receive',
-          peerName: this.connectedPeer?.name || 'Émetteur',
-          startTime: this.incomingFileMeta.startTime
-        });
-      } else if (data.type === 'FILE_COMPLETE' && this.incomingFileMeta && this.incomingFileMeta.id === data.id) {
-        const completeBlob = new Blob(this.incomingFileMeta.receivedChunks, { type: this.incomingFileMeta.type });
-        const receivedArrayBuffer = await completeBlob.arrayBuffer();
-
-        // Calculate real SHA-256
-        const hashBuffer = await crypto.subtle.digest('SHA-256', receivedArrayBuffer);
-        const hashArray = Array.from(new Uint8Array(hashBuffer));
-        const calculatedHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-
-        const isIntegrityValid = calculatedHash === this.incomingFileMeta.checksum;
-
-        const receivedKaydoFile: KaydoFile = {
-          id: this.incomingFileMeta.id,
-          name: this.incomingFileMeta.name,
-          size: this.incomingFileMeta.size,
-          type: this.incomingFileMeta.type,
-          category: this.getCategoryFromType(this.incomingFileMeta.name, this.incomingFileMeta.type),
-          date: new Date().toLocaleDateString(),
-          blob: completeBlob,
-          thumbnail: this.incomingFileMeta.type.startsWith('image/') ? URL.createObjectURL(completeBlob) : undefined
-        };
-
-        const elapsed = (Date.now() - this.incomingFileMeta.startTime) / 1000;
-        const finalSpeed = elapsed > 0 ? (this.incomingFileMeta.size / (1024 * 1024)) / elapsed : 0;
-
-        this.listener?.onTransferProgress?.({
-          id: this.incomingFileMeta.id,
-          fileName: this.incomingFileMeta.name,
-          fileSize: this.incomingFileMeta.size,
-          transferredBytes: this.incomingFileMeta.size,
-          speedMBs: parseFloat(finalSpeed.toFixed(2)),
-          progress: 100,
-          status: isIntegrityValid ? 'completed' : 'error',
-          direction: 'receive',
-          peerName: this.connectedPeer?.name || 'Émetteur',
-          startTime: this.incomingFileMeta.startTime,
-          checksum: calculatedHash,
-          error: isIntegrityValid ? undefined : "Échec de vérification SHA-256"
-        });
-
-        this.listener?.onFileReceived?.(receivedKaydoFile, completeBlob);
-        this.incomingFileMeta = null;
-      }
-    };
+    // Poll for signals (connection requests, answers, file chunks) every 400ms
+    this.signalPollTimer = window.setInterval(() => {
+      this.pollSignalMessages();
+    }, 400);
   }
 
-  private notifyPeers() {
-    const list = Array.from(this.discoveredPeers.values()).map(p => p.device);
-    this.listener?.onPeersUpdated?.(list);
+  private async sendHeartbeat() {
+    try {
+      await fetch('/api/discovery/heartbeat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: this.localDevice.id,
+          name: this.localDevice.name,
+          model: this.localDevice.model,
+          os: this.localDevice.os,
+          avatarColor: this.localDevice.avatarColor
+        })
+      });
+    } catch (e) {
+      // offline or network hiccup
+    }
+  }
+
+  private async pollSignalMessages() {
+    try {
+      const res = await fetch(`/api/signal/messages?myId=${encodeURIComponent(this.localDevice.id)}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data.messages || data.messages.length === 0) return;
+
+      for (const msg of data.messages) {
+        this.handleIncomingSignal(msg);
+      }
+    } catch (e) {
+      // transient network error
+    }
+  }
+
+  private async handleIncomingSignal(msg: any) {
+    const { fromId, type, payload } = msg;
+
+    if (type === 'CONNECT_REQUEST') {
+      const senderDevice: NearbyDevice = payload.sender;
+      this.currentPin = payload.pin || '4829';
+      this.connectedPeer = senderDevice;
+      this.listener?.onIncomingConnectionRequest?.(senderDevice, this.currentPin);
+    } else if (type === 'CONNECT_ACCEPT') {
+      const peerDevice: NearbyDevice = payload.sender;
+      this.connectedPeer = peerDevice;
+      this.state = 'connected';
+      this.currentPin = payload.pin || this.currentPin;
+      this.listener?.onConnectionEstablished?.(peerDevice, this.currentPin);
+    } else if (type === 'CONNECT_REJECT') {
+      this.connectedPeer = null;
+      this.state = 'disconnected';
+      this.listener?.onConnectionRejected?.();
+    } else if (type === 'START_FILE') {
+      this.incomingFileMeta = {
+        id: payload.id,
+        name: payload.name,
+        size: payload.size,
+        type: payload.mimeType,
+        checksum: payload.checksum,
+        totalChunks: payload.totalChunks,
+        receivedChunks: [],
+        bytesReceived: 0,
+        startTime: Date.now()
+      };
+    } else if (type === 'FILE_CHUNK' && this.incomingFileMeta && this.incomingFileMeta.id === payload.id) {
+      // Decode Base64 chunk
+      const binaryString = atob(payload.chunkBase64);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      this.incomingFileMeta.receivedChunks.push(bytes);
+      this.incomingFileMeta.bytesReceived += bytes.byteLength;
+
+      const elapsed = (Date.now() - this.incomingFileMeta.startTime) / 1000;
+      const speedMBs = elapsed > 0 ? (this.incomingFileMeta.bytesReceived / (1024 * 1024)) / elapsed : 0;
+      const progress = Math.min(100, Math.floor((this.incomingFileMeta.bytesReceived / this.incomingFileMeta.size) * 100));
+
+      this.listener?.onTransferProgress?.({
+        id: this.incomingFileMeta.id,
+        fileName: this.incomingFileMeta.name,
+        fileSize: this.incomingFileMeta.size,
+        transferredBytes: this.incomingFileMeta.bytesReceived,
+        speedMBs: parseFloat(speedMBs.toFixed(2)),
+        progress,
+        status: 'transferring',
+        direction: 'receive',
+        peerName: this.connectedPeer?.name || 'Émetteur',
+        startTime: this.incomingFileMeta.startTime
+      });
+    } else if (type === 'FILE_COMPLETE' && this.incomingFileMeta && this.incomingFileMeta.id === payload.id) {
+      const parts = this.incomingFileMeta.receivedChunks;
+      const completeBlob = new Blob(parts, { type: this.incomingFileMeta.type });
+      const arrayBuffer = await completeBlob.arrayBuffer();
+
+      // Real SHA-256 verification
+      const hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      const calculatedHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+
+      const isIntegrityValid = calculatedHash === this.incomingFileMeta.checksum;
+
+      const receivedKaydoFile: KaydoFile = {
+        id: this.incomingFileMeta.id,
+        name: this.incomingFileMeta.name,
+        size: this.incomingFileMeta.size,
+        type: this.incomingFileMeta.type,
+        category: this.getCategoryFromType(this.incomingFileMeta.name, this.incomingFileMeta.type),
+        date: new Date().toLocaleDateString(),
+        blob: completeBlob,
+        thumbnail: this.incomingFileMeta.type.startsWith('image/') ? URL.createObjectURL(completeBlob) : undefined
+      };
+
+      const elapsed = (Date.now() - this.incomingFileMeta.startTime) / 1000;
+      const finalSpeed = elapsed > 0 ? (this.incomingFileMeta.size / (1024 * 1024)) / elapsed : 0;
+
+      this.listener?.onTransferProgress?.({
+        id: this.incomingFileMeta.id,
+        fileName: this.incomingFileMeta.name,
+        fileSize: this.incomingFileMeta.size,
+        transferredBytes: this.incomingFileMeta.size,
+        speedMBs: parseFloat(finalSpeed.toFixed(2)),
+        progress: 100,
+        status: isIntegrityValid ? 'completed' : 'error',
+        direction: 'receive',
+        peerName: this.connectedPeer?.name || 'Émetteur',
+        startTime: this.incomingFileMeta.startTime,
+        checksum: calculatedHash,
+        error: isIntegrityValid ? undefined : "Échec de vérification SHA-256"
+      });
+
+      this.listener?.onFileReceived?.(receivedKaydoFile, completeBlob);
+      this.incomingFileMeta = null;
+    }
+  }
+
+  public async fetchPeers() {
+    try {
+      const res = await fetch(`/api/discovery/peers?myId=${encodeURIComponent(this.localDevice.id)}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data.peers)) {
+        this.discoveredPeers.clear();
+        for (const peer of data.peers) {
+          this.discoveredPeers.set(peer.id, peer);
+        }
+        this.listener?.onPeersUpdated?.(Array.from(this.discoveredPeers.values()));
+      }
+    } catch (e) {
+      // network error
+    }
   }
 
   public startDiscovery() {
     this.state = 'discovering';
-    this.discoveredPeers.clear();
-    this.notifyPeers();
+    this.sendHeartbeat();
+    this.fetchPeers();
 
-    // Broadcast search ping
-    this.discoveryChannel.postMessage({
-      type: 'PING',
-      sender: this.localDevice
-    });
-
-    this.startHeartbeat();
+    if (this.peerPollTimer) clearInterval(this.peerPollTimer);
+    this.peerPollTimer = window.setInterval(() => {
+      this.fetchPeers();
+    }, 1500);
   }
 
   public startAdvertising() {
     this.state = 'advertising';
-    this.isAdvertiser = true;
-    this.discoveredPeers.clear();
-    this.notifyPeers();
+    this.sendHeartbeat();
+    this.fetchPeers();
 
-    this.discoveryChannel.postMessage({
-      type: 'PING',
-      sender: this.localDevice
-    });
-
-    this.startHeartbeat();
-  }
-
-  private startHeartbeat() {
-    this.stopHeartbeat();
-
-    this.heartbeatTimer = window.setInterval(() => {
-      this.discoveryChannel.postMessage({
-        type: 'PING',
-        sender: this.localDevice
-      });
-    }, 3000);
-
-    // Evict stale peers that haven't sent a ping in 8 seconds
-    this.cleanupTimer = window.setInterval(() => {
-      const now = Date.now();
-      let changed = false;
-      for (const [id, record] of this.discoveredPeers.entries()) {
-        if (now - record.lastSeen > 8000) {
-          this.discoveredPeers.delete(id);
-          changed = true;
-        }
-      }
-      if (changed) {
-        this.notifyPeers();
-      }
-    }, 4000);
+    if (this.peerPollTimer) clearInterval(this.peerPollTimer);
+    this.peerPollTimer = window.setInterval(() => {
+      this.fetchPeers();
+    }, 1500);
   }
 
   public stopDiscovery() {
-    this.stopHeartbeat();
+    if (this.peerPollTimer) {
+      clearInterval(this.peerPollTimer);
+      this.peerPollTimer = null;
+    }
     this.state = 'disconnected';
-    this.discoveredPeers.clear();
-    this.notifyPeers();
-  }
-
-  private stopHeartbeat() {
-    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-    if (this.cleanupTimer) clearInterval(this.cleanupTimer);
-    this.heartbeatTimer = null;
-    this.cleanupTimer = null;
   }
 
   public requestConnect(targetDevice: NearbyDevice): string {
     this.state = 'connecting';
     this.connectedPeer = targetDevice;
-    // Generate real random 4-digit numeric PIN for this specific connection
+
+    // Generate random 4-digit code for this pair
     const pin = Math.floor(1000 + Math.random() * 9000).toString();
     this.currentPin = pin;
 
-    this.discoveryChannel.postMessage({
-      type: 'CONNECT_REQUEST',
-      sender: this.localDevice,
-      targetId: targetDevice.id,
-      pin
+    // Send real signal to target device across the network
+    fetch('/api/signal/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fromId: this.localDevice.id,
+        toId: targetDevice.id,
+        type: 'CONNECT_REQUEST',
+        payload: {
+          sender: this.localDevice,
+          pin
+        }
+      })
     });
 
     return pin;
@@ -315,20 +327,35 @@ export class TransferManager {
     this.state = 'connected';
     this.connectedPeer = targetDevice;
 
-    this.discoveryChannel.postMessage({
-      type: 'CONNECT_ACCEPT',
-      sender: this.localDevice,
-      targetId: targetDevice.id
+    fetch('/api/signal/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fromId: this.localDevice.id,
+        toId: targetDevice.id,
+        type: 'CONNECT_ACCEPT',
+        payload: {
+          sender: this.localDevice,
+          pin: this.currentPin
+        }
+      })
     });
 
     this.listener?.onConnectionEstablished?.(targetDevice, this.currentPin);
   }
 
   public rejectConnection(targetDevice: NearbyDevice) {
-    this.discoveryChannel.postMessage({
-      type: 'CONNECT_REJECT',
-      sender: this.localDevice,
-      targetId: targetDevice.id
+    fetch('/api/signal/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fromId: this.localDevice.id,
+        toId: targetDevice.id,
+        type: 'CONNECT_REJECT',
+        payload: {
+          sender: this.localDevice
+        }
+      })
     });
     this.connectedPeer = null;
   }
@@ -343,15 +370,16 @@ export class TransferManager {
 
   /**
    * Real File Transfer:
-   * Slices actual Blob into binary ArrayBuffers, computes SHA-256, streams chunks,
-   * measures actual speed and time.
+   * Slices actual Blob into binary chunks, converts to Base64, computes SHA-256,
+   * streams across the network to target peer.
    */
   public async sendFiles(files: KaydoFile[], onProgress: (task: TransferTask) => void) {
     if (!this.connectedPeer) {
       throw new Error("Aucun appareil connecté. Établissez d'abord une connexion.");
     }
 
-    const chunkSize = 64 * 1024; // 64 KB binary chunks
+    const targetId = this.connectedPeer.id;
+    const chunkSize = 32 * 1024; // 32 KB chunks for reliable mobile network delivery
 
     for (const file of files) {
       if (!file.blob) {
@@ -361,21 +389,29 @@ export class TransferManager {
       const totalSize = file.size;
       const totalChunks = Math.ceil(totalSize / chunkSize);
 
-      // Compute actual SHA-256 hash of the real file
+      // Compute actual SHA-256 hash
       const wholeBuffer = await file.blob.arrayBuffer();
       const hashBuffer = await crypto.subtle.digest('SHA-256', wholeBuffer);
       const hashArray = Array.from(new Uint8Array(hashBuffer));
       const checksum = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 
       // Send START_FILE metadata
-      this.dataChannel.postMessage({
-        type: 'START_FILE',
-        id: file.id,
-        name: file.name,
-        size: totalSize,
-        mimeType: file.type,
-        checksum,
-        totalChunks
+      await fetch('/api/signal/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fromId: this.localDevice.id,
+          toId: targetId,
+          type: 'START_FILE',
+          payload: {
+            id: file.id,
+            name: file.name,
+            size: totalSize,
+            mimeType: file.type,
+            checksum,
+            totalChunks
+          }
+        })
       });
 
       const startTime = Date.now();
@@ -386,12 +422,28 @@ export class TransferManager {
         const end = Math.min(totalSize, start + chunkSize);
         const slice = file.blob.slice(start, end);
         const chunkBuffer = await slice.arrayBuffer();
+        const bytes = new Uint8Array(chunkBuffer);
 
-        this.dataChannel.postMessage({
-          type: 'FILE_CHUNK',
-          id: file.id,
-          chunkIndex,
-          chunk: chunkBuffer
+        // Convert binary chunk to base64
+        let binary = '';
+        for (let i = 0; i < bytes.byteLength; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        const chunkBase64 = btoa(binary);
+
+        await fetch('/api/signal/send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fromId: this.localDevice.id,
+            toId: targetId,
+            type: 'FILE_CHUNK',
+            payload: {
+              id: file.id,
+              chunkIndex,
+              chunkBase64
+            }
+          })
         });
 
         bytesSent += chunkBuffer.byteLength;
@@ -414,14 +466,22 @@ export class TransferManager {
           checksum
         });
 
-        // Small yield so the UI renders progress smoothly
-        await new Promise(r => setTimeout(r, 15));
+        // Small delay to prevent network congestion
+        await new Promise(r => setTimeout(r, 20));
       }
 
       // Send completion message
-      this.dataChannel.postMessage({
-        type: 'FILE_COMPLETE',
-        id: file.id
+      await fetch('/api/signal/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fromId: this.localDevice.id,
+          toId: targetId,
+          type: 'FILE_COMPLETE',
+          payload: {
+            id: file.id
+          }
+        })
       });
 
       const totalTime = (Date.now() - startTime) / 1000;

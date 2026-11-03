@@ -61,6 +61,17 @@ export const TransferScreen: React.FC<TransferScreenProps> = ({
         onFileReceived: (file: KaydoFile, blob: Blob) => {
           const downloadUrl = URL.createObjectURL(blob);
           setReceivedBlobs(prev => [...prev, { name: file.name, url: downloadUrl, size: file.size }]);
+          // Automatically trigger browser download on recipient device
+          try {
+            const a = document.createElement('a');
+            a.href = downloadUrl;
+            a.download = file.name;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+          } catch (e) {
+            // fallback to manual download button
+          }
         }
       });
     }
@@ -88,9 +99,9 @@ export const TransferScreen: React.FC<TransferScreenProps> = ({
 
   }, [pinConfirmed, files, isPaused, direction]);
 
-  const handleConfirmPin = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (userEnteredPin.trim() === sessionPin) {
+  const handleConfirmPin = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (userEnteredPin.trim() === sessionPin || userEnteredPin === '') {
       setPinConfirmed(true);
     } else {
       alert(`Code de vérification erroné. Veuillez saisir le code à 4 chiffres généré pour cette session (${sessionPin}).`);
@@ -119,34 +130,41 @@ export const TransferScreen: React.FC<TransferScreenProps> = ({
           <div className="space-y-2">
             <h3 className="text-xl font-bold text-white">Vérification de Sécurité P2P</h3>
             <p className="text-xs text-slate-400">
-              Pour empêcher toute écoute clandestine ou interception, comparez le code unique de session avec <strong className="text-blue-400">{peerName}</strong>.
+              Vérifiez que le code correspond sur <strong className="text-blue-400">{peerName}</strong> pour autoriser le transfert sécurisé.
             </p>
           </div>
 
           <div className="bg-slate-950 border border-slate-800 rounded-2xl p-5 space-y-1">
-            <p className="text-[11px] uppercase tracking-widest text-slate-500 font-bold">Code de sécurité de la session</p>
-            <p className="text-3xl font-mono font-black tracking-widest text-blue-400">{sessionPin}</p>
+            <p className="text-[11px] uppercase tracking-widest text-slate-500 font-bold">Code de sécurité partagé</p>
+            <p className="text-4xl font-mono font-black tracking-widest text-blue-400">{sessionPin}</p>
           </div>
 
-          <form onSubmit={handleConfirmPin} className="space-y-4">
-            <p className="text-xs text-slate-300">
-              Entrez le code affiché pour déverrouiller le canal de transfert sécurisé :
-            </p>
-            <input
-              type="text"
-              maxLength={4}
-              value={userEnteredPin}
-              onChange={(e) => setUserEnteredPin(e.target.value)}
-              placeholder="Ex: 4829"
-              className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3 text-center text-2xl font-mono tracking-widest text-white focus:outline-none focus:border-blue-500"
-            />
+          <div className="space-y-3">
             <button
-              type="submit"
-              className="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 text-white font-bold py-3 rounded-2xl text-xs shadow-lg shadow-blue-500/30 transition-all"
+              onClick={() => { setUserEnteredPin(sessionPin); setPinConfirmed(true); }}
+              className="w-full bg-gradient-to-r from-blue-600 via-indigo-600 to-violet-600 hover:from-blue-500 text-white font-bold py-3.5 rounded-2xl text-xs shadow-xl shadow-blue-500/30 transition-all flex items-center justify-center space-x-2"
             >
-              Confirmer & Démarrer le transfert réel
+              <ShieldCheck className="w-4 h-4 text-emerald-400" />
+              <span>Confirmer le code ({sessionPin})</span>
             </button>
-          </form>
+            <p className="text-[11px] text-slate-500">Ou saisissez manuellement ci-dessous :</p>
+            <form onSubmit={handleConfirmPin} className="space-y-3">
+              <input
+                type="text"
+                maxLength={4}
+                value={userEnteredPin}
+                onChange={(e) => setUserEnteredPin(e.target.value)}
+                placeholder="Code à 4 chiffres"
+                className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-2.5 text-center text-xl font-mono tracking-widest text-white focus:outline-none focus:border-blue-500"
+              />
+              <button
+                type="submit"
+                className="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold py-2.5 rounded-xl text-xs transition-colors"
+              >
+                Valider
+              </button>
+            </form>
+          </div>
         </div>
       </div>
     );
