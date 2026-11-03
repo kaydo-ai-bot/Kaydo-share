@@ -50,6 +50,10 @@ export const RadarScanner: React.FC<RadarScannerProps> = ({
     } else {
       manager.startAdvertising();
     }
+
+    return () => {
+      manager.stopDiscovery();
+    };
   }, [mode]);
 
   const handleAcceptIncoming = () => {

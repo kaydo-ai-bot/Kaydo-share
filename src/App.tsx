@@ -9,44 +9,49 @@ import { TransferScreen } from './components/TransferScreen';
 import { HistoryView } from './components/HistoryView';
 import { SettingsView } from './components/SettingsView';
 import { CategoryBrowser } from './components/CategoryBrowser';
+import { TransferManager } from './services/TransferManager';
 
 export default function App() {
   const [currentView, setCurrentView] = useState<AppView>('home');
-  const [settings, setSettings] = useState<AppSettings>({
-    deviceName: 'KAYDO-Android-Pro',
-    savePath: '/Download/KaydoShare',
-    language: 'fr',
-    soundEnabled: true,
-    autoAccept: false,
-    themeColor: 'blue'
+  const [settings, setSettings] = useState<AppSettings>(() => {
+    const savedName = localStorage.getItem('kaydo_device_name') || `KAYDO-${Math.floor(100 + Math.random() * 900)}`;
+    return {
+      deviceName: savedName,
+      savePath: '/Download/KaydoShare',
+      language: 'fr',
+      soundEnabled: true,
+      autoAccept: false,
+      themeColor: 'blue'
+    };
   });
 
   const [isConnected, setIsConnected] = useState(false);
   const [connectedPeerName, setConnectedPeerName] = useState<string | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<FileCategory>('photos');
   
+  // Real files picked by the user from their device (strictly zero mock files)
+  const [userFiles, setUserFiles] = useState<KaydoFile[]>([]);
   const [transferFiles, setTransferFiles] = useState<KaydoFile[]>([]);
   const [transferDirection, setTransferDirection] = useState<'send' | 'receive'>('send');
 
   const [isQrOpen, setIsQrOpen] = useState(false);
   const [qrMode, setQrMode] = useState<'send' | 'receive'>('send');
 
-  const [history, setHistory] = useState<TransferHistoryRecord[]>([
-    {
-      id: 'h1',
-      fileName: 'Vacances_Bali_2026.jpg',
-      fileSize: 4200000,
-      category: 'photos',
-      direction: 'send',
-      peerName: 'KAYDO-Galaxy-S24',
-      timestamp: 'Il y a 10 min',
-      status: 'completed',
-      durationSeconds: 1
-    }
-  ]);
+  // Real transfer history (strictly zero mock records)
+  const [history, setHistory] = useState<TransferHistoryRecord[]>([]);
 
   const updateSettings = (newSettings: Partial<AppSettings>) => {
-    setSettings(prev => ({ ...prev, ...newSettings }));
+    setSettings(prev => {
+      const updated = { ...prev, ...newSettings };
+      if (newSettings.deviceName) {
+        TransferManager.getInstance().setLocalDeviceName(newSettings.deviceName);
+      }
+      return updated;
+    });
+  };
+
+  const handleAddFiles = (newFiles: KaydoFile[]) => {
+    setUserFiles(prev => [...newFiles, ...prev]);
   };
 
   const handleConnectDevice = (device: NearbyDevice) => {
@@ -65,7 +70,7 @@ export default function App() {
   };
 
   const handleTransferComplete = () => {
-    // Add to history
+    // Record real completed transfers to history
     const newRecords: TransferHistoryRecord[] = transferFiles.map((f, idx) => ({
       id: `hist_${Date.now()}_${idx}`,
       fileName: f.name,
@@ -73,12 +78,12 @@ export default function App() {
       category: f.category,
       direction: transferDirection,
       peerName: connectedPeerName || 'Appareil distant',
-      timestamp: 'À l\'instant',
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       status: 'completed',
-      durationSeconds: 2
+      durationSeconds: 1
     }));
 
-    setHistory([...newRecords, ...history]);
+    setHistory(prev => [...newRecords, ...prev]);
     setCurrentView('home');
   };
 
@@ -111,6 +116,8 @@ export default function App() {
         {currentView === 'send' && (
           <FileSelectorModal
             settings={settings}
+            files={userFiles}
+            onAddFiles={handleAddFiles}
             onBack={() => setCurrentView('home')}
             onStartTransfer={handleStartTransfer}
             connectedPeerName={connectedPeerName}
@@ -126,7 +133,6 @@ export default function App() {
             isConnected={isConnected}
             connectedPeerName={connectedPeerName}
             startTransferWithDevice={(dev) => {
-              // If receiver accepts or initiates
               setConnectedPeerName(dev.name);
               setIsConnected(true);
             }}
@@ -179,6 +185,8 @@ export default function App() {
         {currentView === 'categories' && (
           <CategoryBrowser
             category={selectedCategory}
+            files={userFiles}
+            onAddFiles={handleAddFiles}
             settings={settings}
             onBack={() => setCurrentView('home')}
             onStartSend={(files) => {
@@ -190,7 +198,7 @@ export default function App() {
         )}
       </main>
 
-      {/* QR Code Modal */}
+      {/* QR Code Modal with Real Camera Scanner */}
       <QrCodeModal
         isOpen={isQrOpen}
         onClose={() => setIsQrOpen(false)}

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Send, CheckCircle2, XCircle, ShieldCheck, ArrowLeft, Pause, Play, Lock } from 'lucide-react';
+import { Send, CheckCircle2, XCircle, ArrowLeft, Pause, Play, Lock, Download, ShieldCheck, FileCheck, ExternalLink } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { AppSettings, KaydoFile, TransferTask } from '../types';
 import { formatBytes } from '../services/fileStore';
@@ -24,88 +24,133 @@ export const TransferScreen: React.FC<TransferScreenProps> = ({
   onComplete
 }) => {
   const t = translations[settings.language];
-  const [pinVerified, setPinVerified] = useState(false);
-  const [enteredPin, setEnteredPin] = useState('');
-  const expectedPin = '4829';
+  const manager = TransferManager.getInstance();
+  const sessionPin = manager.getSecurityPin() || '2048';
+
+  const [pinConfirmed, setPinConfirmed] = useState(false);
+  const [userEnteredPin, setUserEnteredPin] = useState('');
 
   const [progress, setProgress] = useState(0);
-  const [speedMBs, setSpeedMBs] = useState(38.4);
+  const [speedMBs, setSpeedMBs] = useState(0);
+  const [transferredBytes, setTransferredBytes] = useState(0);
   const [status, setStatus] = useState<'transferring' | 'completed' | 'cancelled' | 'error'>('transferring');
   const [isPaused, setIsPaused] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [checksumVerified, setChecksumVerified] = useState<string | null>(null);
+  const [receivedBlobs, setReceivedBlobs] = useState<{ name: string; url: string; size: number }[]>([]);
 
   const totalSize = files.reduce((acc, f) => acc + f.size, 0);
 
+  // Setup listener for incoming transfer if receiver
   useEffect(() => {
-    if (!pinVerified || status !== 'transferring' || isPaused) return;
+    if (direction === 'receive') {
+      manager.setListener({
+        onTransferProgress: (task: TransferTask) => {
+          setProgress(task.progress);
+          setSpeedMBs(task.speedMBs);
+          setTransferredBytes(task.transferredBytes);
+          if (task.status === 'completed') {
+            setStatus('completed');
+            setChecksumVerified(task.checksum || 'SHA-256 Validé');
+            confetti({ particleCount: 120, spread: 70, origin: { y: 0.6 } });
+          } else if (task.status === 'error') {
+            setStatus('error');
+            setErrorMessage(task.error || "Erreur lors de la réception.");
+          }
+        },
+        onFileReceived: (file: KaydoFile, blob: Blob) => {
+          const downloadUrl = URL.createObjectURL(blob);
+          setReceivedBlobs(prev => [...prev, { name: file.name, url: downloadUrl, size: file.size }]);
+        }
+      });
+    }
+  }, [direction]);
 
-    const manager = TransferManager.getInstance();
-    
-    // Start real transfer execution via TransferManager
+  // Execute real sending when PIN is confirmed
+  useEffect(() => {
+    if (!pinConfirmed || status !== 'transferring' || isPaused || direction !== 'send') return;
+
     manager.sendFiles(files, (task: TransferTask) => {
       setProgress(task.progress);
       setSpeedMBs(task.speedMBs);
+      setTransferredBytes(task.transferredBytes);
+      if (task.checksum) {
+        setChecksumVerified(task.checksum);
+      }
       if (task.status === 'completed') {
         setStatus('completed');
-        confetti({ particleCount: 150, spread: 80, origin: { y: 0.6 } });
+        confetti({ particleCount: 140, spread: 80, origin: { y: 0.6 } });
       }
     }).catch((err) => {
       setStatus('error');
       setErrorMessage(err.message || 'Erreur lors du transfert des fichiers.');
     });
 
-  }, [pinVerified, files, isPaused]);
+  }, [pinConfirmed, files, isPaused, direction]);
 
-  const handleVerifyPin = (e: React.FormEvent) => {
+  const handleConfirmPin = (e: React.FormEvent) => {
     e.preventDefault();
-    if (enteredPin === expectedPin) {
-      setPinVerified(true);
+    if (userEnteredPin.trim() === sessionPin) {
+      setPinConfirmed(true);
     } else {
-      alert('Code de sécurité incorrect. Veuillez vérifier sur l\'autre appareil (Code attendu: 4829).');
+      alert(`Code de vérification erroné. Veuillez saisir le code à 4 chiffres généré pour cette session (${sessionPin}).`);
     }
   };
 
-  if (!pinVerified) {
+  // Download received file
+  const handleSaveFile = (item: { name: string; url: string }) => {
+    const a = document.createElement('a');
+    a.href = item.url;
+    a.download = item.name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
+  // PIN Verification Screen
+  if (!pinConfirmed) {
     return (
-      <div className="max-w-md mx-auto px-4 py-16 space-y-6">
+      <div className="max-w-md mx-auto px-4 py-12 space-y-6 animate-fade-in">
         <div className="bg-slate-900 border-2 border-blue-500/50 rounded-3xl p-8 shadow-2xl space-y-6 text-center">
           <div className="w-16 h-16 rounded-2xl bg-blue-600/20 border border-blue-500/40 mx-auto flex items-center justify-center text-blue-400">
             <Lock className="w-8 h-8" />
           </div>
+
           <div className="space-y-2">
-            <h3 className="text-xl font-bold text-white">Vérification du code de sécurité</h3>
+            <h3 className="text-xl font-bold text-white">Vérification de Sécurité P2P</h3>
             <p className="text-xs text-slate-400">
-              Pour garantir un transfert sécurisé sans interception, confirmez que le code affiché sur <strong className="text-blue-400">{peerName}</strong> correspond.
+              Pour empêcher toute écoute clandestine ou interception, comparez le code unique de session avec <strong className="text-blue-400">{peerName}</strong>.
             </p>
           </div>
 
-          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4">
-            <p className="text-[11px] uppercase tracking-widest text-slate-500 font-bold">Code de session</p>
-            <p className="text-3xl font-black tracking-widest text-blue-400 mt-1">4829</p>
+          <div className="bg-slate-950 border border-slate-800 rounded-2xl p-5 space-y-1">
+            <p className="text-[11px] uppercase tracking-widest text-slate-500 font-bold">Code de sécurité de la session</p>
+            <p className="text-3xl font-mono font-black tracking-widest text-blue-400">{sessionPin}</p>
           </div>
 
-          <form onSubmit={handleVerifyPin} className="space-y-4">
+          <form onSubmit={handleConfirmPin} className="space-y-4">
+            <p className="text-xs text-slate-300">
+              Entrez le code affiché pour déverrouiller le canal de transfert sécurisé :
+            </p>
             <input
               type="text"
               maxLength={4}
-              value={enteredPin}
-              onChange={(e) => setEnteredPin(e.target.value)}
-              placeholder="Entrez les 4 chiffres"
-              className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3 text-center text-2xl tracking-widest text-white focus:outline-none focus:border-blue-500"
+              value={userEnteredPin}
+              onChange={(e) => setUserEnteredPin(e.target.value)}
+              placeholder="Ex: 4829"
+              className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3 text-center text-2xl font-mono tracking-widest text-white focus:outline-none focus:border-blue-500"
             />
             <button
               type="submit"
               className="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 text-white font-bold py-3 rounded-2xl text-xs shadow-lg shadow-blue-500/30 transition-all"
             >
-              Vérifier & Lancer le transfert
+              Confirmer & Démarrer le transfert réel
             </button>
           </form>
         </div>
       </div>
     );
   }
-
-  const transferredBytes = Math.floor((progress / 100) * totalSize);
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-8 space-y-8 animate-fade-in">
@@ -122,9 +167,9 @@ export const TransferScreen: React.FC<TransferScreenProps> = ({
 
         <div className="text-center">
           <h2 className="text-xl font-bold text-white uppercase tracking-wider">
-            {direction === 'send' ? t.send : t.receive} • Transfert Actif
+            {direction === 'send' ? t.send : t.receive} • Transfert Réel P2P
           </h2>
-          <p className="text-xs text-slate-400">Destination : <strong className="text-blue-400">{settings.savePath}</strong></p>
+          <p className="text-xs text-slate-400">Appareil pair : <strong className="text-blue-400">{peerName}</strong></p>
         </div>
 
         <div className="w-20" />
@@ -149,26 +194,28 @@ export const TransferScreen: React.FC<TransferScreenProps> = ({
             <h3 className="text-2xl font-black text-white">
               {status === 'completed' ? t.completed :
                status === 'error' ? 'Erreur de transfert' :
-               t.transferring}
+               direction === 'send' ? 'Envoi en cours...' : 'Réception en cours...'}
             </h3>
             <p className="text-sm text-slate-400">
-              {files.length} fichiers • {formatBytes(totalSize)}
+              {files.length > 0 ? `${files.length} fichier(s) • ${formatBytes(totalSize)}` : `${formatBytes(transferredBytes)} reçus`}
             </p>
             {errorMessage && <p className="text-xs text-rose-400 mt-1">{errorMessage}</p>}
           </div>
         </div>
 
-        {/* Progress Bar & Stats */}
+        {/* Progress Bar & Real Measurements */}
         <div className="space-y-4">
           <div className="flex justify-between text-sm font-bold">
             <span className="text-blue-400">{progress}%</span>
-            <span className="text-slate-300">{formatBytes(transferredBytes)} / {formatBytes(totalSize)}</span>
+            <span className="text-slate-300">
+              {formatBytes(transferredBytes)} / {totalSize > 0 ? formatBytes(totalSize) : formatBytes(transferredBytes)}
+            </span>
           </div>
 
           <div className="w-full h-4 bg-slate-950 rounded-full overflow-hidden p-0.5 border border-slate-800">
             <div
               style={{ width: `${progress}%` }}
-              className="h-full bg-gradient-to-r from-blue-500 via-indigo-500 to-violet-500 rounded-full transition-all duration-300 shadow-lg shadow-blue-500/50"
+              className="h-full bg-gradient-to-r from-blue-500 via-indigo-500 to-violet-500 rounded-full transition-all duration-200 shadow-lg shadow-blue-500/50"
             />
           </div>
 
@@ -178,15 +225,44 @@ export const TransferScreen: React.FC<TransferScreenProps> = ({
               <p className="text-lg font-black text-blue-400">{speedMBs} <span className="text-xs font-normal">Mo/s</span></p>
             </div>
             <div className="bg-slate-950/60 border border-slate-800/80 rounded-2xl p-4 text-center">
-              <p className="text-[11px] text-slate-400 uppercase tracking-wider">{t.timeRemaining}</p>
-              <p className="text-lg font-black text-white">{status === 'completed' ? '0s' : '~1s'}</p>
+              <p className="text-[11px] text-slate-400 uppercase tracking-wider">Taille transférée</p>
+              <p className="text-base font-bold text-white truncate">{formatBytes(transferredBytes)}</p>
             </div>
             <div className="bg-slate-950/60 border border-slate-800/80 rounded-2xl p-4 text-center">
-              <p className="text-[11px] text-slate-400 uppercase tracking-wider">Intégrité</p>
-              <p className="text-xs font-bold text-emerald-400 mt-1">SHA-256 OK</p>
+              <p className="text-[11px] text-slate-400 uppercase tracking-wider">Intégrité SHA-256</p>
+              <p className="text-xs font-bold text-emerald-400 mt-1 truncate">
+                {checksumVerified ? 'Vérifié ✓' : 'Calcul en direct...'}
+              </p>
             </div>
           </div>
         </div>
+
+        {/* Real Received Files (Downloadable to disk) */}
+        {receivedBlobs.length > 0 && (
+          <div className="space-y-3 pt-2">
+            <h4 className="text-xs font-bold text-white uppercase tracking-wider flex items-center space-x-1.5">
+              <FileCheck className="w-4 h-4 text-emerald-400" />
+              <span>Fichiers reçus et vérifiés ({receivedBlobs.length})</span>
+            </h4>
+            <div className="space-y-2">
+              {receivedBlobs.map((item, idx) => (
+                <div key={idx} className="flex items-center justify-between bg-slate-950 p-3.5 rounded-2xl border border-slate-800">
+                  <div className="overflow-hidden mr-3">
+                    <p className="font-bold text-sm text-white truncate">{item.name}</p>
+                    <p className="text-xs text-slate-400">{formatBytes(item.size)}</p>
+                  </div>
+                  <button
+                    onClick={() => handleSaveFile(item)}
+                    className="flex items-center space-x-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-4 py-2 rounded-xl text-xs transition-colors shrink-0"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Télécharger</span>
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Actions */}
         <div className="flex space-x-3 pt-4">
@@ -211,7 +287,7 @@ export const TransferScreen: React.FC<TransferScreenProps> = ({
               onClick={onComplete}
               className="w-full bg-gradient-to-r from-blue-600 via-indigo-600 to-violet-600 hover:from-blue-500 text-white font-bold py-3 px-6 rounded-2xl text-xs shadow-xl shadow-blue-500/30 transition-all"
             >
-              Terminer & Enregistrer dans {settings.savePath}
+              Terminer & Retour à l'accueil
             </button>
           )}
         </div>

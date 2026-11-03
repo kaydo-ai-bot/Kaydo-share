@@ -1,11 +1,13 @@
 import React, { useState } from 'react';
-import { ArrowLeft, Image, Video, Music, Smartphone, FileText, FolderDown, Search, Download } from 'lucide-react';
+import { ArrowLeft, Image, Video, Music, Smartphone, FileText, FolderDown, Search, Download, Plus, AlertCircle } from 'lucide-react';
 import { AppSettings, FileCategory, KaydoFile } from '../types';
-import { INITIAL_FILES, formatBytes } from '../services/fileStore';
+import { createKaydoFile, formatBytes } from '../services/fileStore';
 import { translations } from '../i18n';
 
 interface CategoryBrowserProps {
   category: FileCategory;
+  files: KaydoFile[];
+  onAddFiles: (newFiles: KaydoFile[]) => void;
   settings: AppSettings;
   onBack: () => void;
   onStartSend: (files: KaydoFile[]) => void;
@@ -13,15 +15,17 @@ interface CategoryBrowserProps {
 
 export const CategoryBrowser: React.FC<CategoryBrowserProps> = ({
   category,
+  files,
+  onAddFiles,
   settings,
   onBack,
   onStartSend
 }) => {
   const t = translations[settings.language];
-  const [files] = useState<KaydoFile[]>(INITIAL_FILES.filter(f => f.category === category));
   const [searchQuery, setSearchQuery] = useState('');
 
-  const filteredFiles = files.filter(f => f.name.toLowerCase().includes(searchQuery.toLowerCase()));
+  const categoryFiles = files.filter(f => f.category === category);
+  const filteredFiles = categoryFiles.filter(f => f.name.toLowerCase().includes(searchQuery.toLowerCase()));
 
   const categoryTitles: Record<FileCategory, string> = {
     photos: t.photos,
@@ -30,6 +34,28 @@ export const CategoryBrowser: React.FC<CategoryBrowserProps> = ({
     apps: t.apps,
     documents: t.documents,
     downloads: t.downloads
+  };
+
+  const fileAccepts: Record<FileCategory, string> = {
+    photos: 'image/*',
+    videos: 'video/*',
+    music: 'audio/*',
+    apps: '.apk,application/vnd.android.package-archive',
+    documents: '.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt',
+    downloads: '*/*'
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      const added: KaydoFile[] = [];
+      for (const file of Array.from(e.target.files)) {
+        const kaydoFile = await createKaydoFile(file);
+        // Force the category if selected from here
+        kaydoFile.category = category;
+        added.push(kaydoFile);
+      }
+      onAddFiles(added);
+    }
   };
 
   return (
@@ -49,28 +75,58 @@ export const CategoryBrowser: React.FC<CategoryBrowserProps> = ({
           <h2 className="text-xl font-bold text-white uppercase tracking-wider">
             {categoryTitles[category]}
           </h2>
-          <p className="text-xs text-slate-400">{filteredFiles.length} fichiers disponibles</p>
+          <p className="text-xs text-slate-400">{categoryFiles.length} fichiers réels sur l'appareil</p>
         </div>
 
-        <div className="w-20" />
+        {/* Add files to this specific category */}
+        <label className="flex items-center space-x-1.5 bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-xl text-xs font-bold cursor-pointer shadow-lg shadow-blue-600/30 transition-all">
+          <Plus className="w-4 h-4" />
+          <span>Ajouter</span>
+          <input
+            type="file"
+            multiple
+            accept={fileAccepts[category]}
+            onChange={handleFileChange}
+            className="hidden"
+          />
+        </label>
       </div>
 
-      {/* Search Input */}
-      <div className="relative">
-        <Search className="absolute left-4 top-3.5 w-4 h-4 text-slate-400" />
-        <input
-          type="text"
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          placeholder={t.searchPlaceholder}
-          className="w-full bg-slate-900/80 border border-slate-800 rounded-2xl pl-11 pr-4 py-3 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition-colors"
-        />
-      </div>
+      {/* Search Input if files exist */}
+      {categoryFiles.length > 0 && (
+        <div className="relative">
+          <Search className="absolute left-4 top-3.5 w-4 h-4 text-slate-400" />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder={t.searchPlaceholder}
+            className="w-full bg-slate-900/80 border border-slate-800 rounded-2xl pl-11 pr-4 py-3 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition-colors"
+          />
+        </div>
+      )}
 
       {/* Files List / Grid */}
-      {filteredFiles.length === 0 ? (
-        <div className="bg-slate-900/60 border border-slate-800 rounded-3xl p-12 text-center space-y-3">
-          <p className="text-slate-400 text-sm">Aucun fichier trouvé dans cette catégorie.</p>
+      {categoryFiles.length === 0 ? (
+        <div className="bg-slate-900/60 border border-slate-800 rounded-3xl p-12 text-center space-y-4">
+          <AlertCircle className="w-12 h-12 text-slate-600 mx-auto" />
+          <div className="space-y-1">
+            <h3 className="text-base font-bold text-white">Aucun fichier dans cette catégorie</h3>
+            <p className="text-xs text-slate-400 max-w-md mx-auto">
+              KAYDO SHARE ne propose aucun contenu pré-rempli ou fictif. Cliquez sur le bouton ci-dessous pour choisir de vrais fichiers depuis votre appareil.
+            </p>
+          </div>
+          <label className="inline-flex items-center space-x-2 px-5 py-2.5 rounded-2xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold cursor-pointer transition-colors shadow-lg shadow-blue-600/20">
+            <Plus className="w-4 h-4" />
+            <span>Sélectionner des {categoryTitles[category]}</span>
+            <input
+              type="file"
+              multiple
+              accept={fileAccepts[category]}
+              onChange={handleFileChange}
+              className="hidden"
+            />
+          </label>
         </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
