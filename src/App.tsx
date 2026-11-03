@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { AppSettings, AppView, FileCategory, KaydoFile, NearbyDevice, TransferHistoryRecord } from './types';
 import { Navbar } from './components/Navbar';
 import { HeroActions } from './components/HeroActions';
@@ -15,13 +15,16 @@ export default function App() {
   const [currentView, setCurrentView] = useState<AppView>('home');
   const [settings, setSettings] = useState<AppSettings>(() => {
     const savedName = localStorage.getItem('kaydo_device_name') || `KAYDO-${Math.floor(100 + Math.random() * 900)}`;
+    const savedTheme = (localStorage.getItem('kaydo_theme') as 'dark' | 'light') || 'dark';
     return {
       deviceName: savedName,
       savePath: '/Download/KaydoShare',
       language: 'fr',
+      themeMode: savedTheme,
       soundEnabled: true,
       autoAccept: false,
-      themeColor: 'blue'
+      themeColor: 'blue',
+      preferredTechnology: 'auto'
     };
   });
 
@@ -39,6 +42,15 @@ export default function App() {
 
   // Real transfer history (strictly zero mock records)
   const [history, setHistory] = useState<TransferHistoryRecord[]>([]);
+
+  useEffect(() => {
+    localStorage.setItem('kaydo_theme', settings.themeMode);
+    if (settings.themeMode === 'light') {
+      document.documentElement.classList.remove('dark');
+    } else {
+      document.documentElement.classList.add('dark');
+    }
+  }, [settings.themeMode]);
 
   const updateSettings = (newSettings: Partial<AppSettings>) => {
     setSettings(prev => {
@@ -80,15 +92,20 @@ export default function App() {
       peerName: connectedPeerName || 'Appareil distant',
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       status: 'completed',
-      durationSeconds: 1
+      durationSeconds: 1,
+      technology: 'WebRTC DataChannel'
     }));
 
     setHistory(prev => [...newRecords, ...prev]);
     setCurrentView('home');
   };
 
+  const isDark = settings.themeMode !== 'light';
+
   return (
-    <div className="min-h-screen bg-[#07080f] text-slate-100 flex flex-col font-sans selection:bg-blue-500 selection:text-white">
+    <div className={`min-h-screen flex flex-col font-sans transition-colors selection:bg-blue-500 selection:text-white ${
+      isDark ? 'bg-[#07080f] text-slate-100' : 'bg-[#f8fafc] text-slate-900'
+    }`}>
       
       {/* Top Navbar */}
       <Navbar

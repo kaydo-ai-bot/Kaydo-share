@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ArrowLeft, Image, Video, Music, Smartphone, FileText, FolderDown, Search, Download, Plus, AlertCircle } from 'lucide-react';
+import { ArrowLeft, Image, Video, Music, Smartphone, FileText, Folder, FolderDown, Search, Download, Plus, AlertCircle } from 'lucide-react';
 import { AppSettings, FileCategory, KaydoFile } from '../types';
 import { createKaydoFile, formatBytes } from '../services/fileStore';
 import { translations } from '../i18n';
@@ -33,7 +33,8 @@ export const CategoryBrowser: React.FC<CategoryBrowserProps> = ({
     music: t.music,
     apps: t.apps,
     documents: t.documents,
-    downloads: t.downloads
+    downloads: t.downloads,
+    folders: t.folders || 'Dossiers'
   };
 
   const fileAccepts: Record<FileCategory, string> = {
@@ -42,7 +43,8 @@ export const CategoryBrowser: React.FC<CategoryBrowserProps> = ({
     music: 'audio/*',
     apps: '.apk,application/vnd.android.package-archive',
     documents: '.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt',
-    downloads: '*/*'
+    downloads: '*/*',
+    folders: '*/*'
   };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -50,8 +52,11 @@ export const CategoryBrowser: React.FC<CategoryBrowserProps> = ({
       const added: KaydoFile[] = [];
       for (const file of Array.from(e.target.files)) {
         const kaydoFile = await createKaydoFile(file);
-        // Force the category if selected from here
         kaydoFile.category = category;
+        // If it's a folder, capture relative path
+        if ((file as any).webkitRelativePath) {
+          kaydoFile.relativePath = (file as any).webkitRelativePath;
+        }
         added.push(kaydoFile);
       }
       onAddFiles(added);
@@ -141,11 +146,12 @@ export const CategoryBrowser: React.FC<CategoryBrowserProps> = ({
                     {category === 'photos' ? <Image className="w-5 h-5" /> :
                      category === 'videos' ? <Video className="w-5 h-5" /> :
                      category === 'music' ? <Music className="w-5 h-5" /> :
-                     category === 'apps' ? <Smartphone className="w-5 h-5" /> : <FileText className="w-5 h-5" />}
+                     category === 'apps' ? <Smartphone className="w-5 h-5" /> :
+                     category === 'folders' ? <Folder className="w-5 h-5" /> : <FileText className="w-5 h-5" />}
                   </div>
                   <div className="overflow-hidden">
                     <h4 className="font-bold text-sm text-white truncate max-w-[170px]">{file.name}</h4>
-                    <p className="text-xs text-slate-400">{formatBytes(file.size)} • {file.date}</p>
+                    <p className="text-xs text-slate-400">{formatBytes(file.size)} • {file.relativePath || file.date}</p>
                   </div>
                 </div>
               </div>

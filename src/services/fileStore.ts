@@ -1,6 +1,6 @@
 import { FileCategory, KaydoFile } from '../types';
 
-// Zero fake/mock files. Starts completely empty until the user picks real files from their device.
+// Zero mock files: starts empty until real files/folders are selected by the user.
 export const INITIAL_FILES: KaydoFile[] = [];
 
 export function categorizeFile(file: File): FileCategory {
@@ -11,6 +11,9 @@ export function categorizeFile(file: File): FileCategory {
   if (type.startsWith('image/')) return 'photos';
   if (type.startsWith('video/')) return 'videos';
   if (type.startsWith('audio/')) return 'music';
+  if (name.endsWith('.zip') || name.endsWith('.tar') || name.endsWith('.gz') || name.endsWith('.rar') || name.endsWith('.7z')) {
+    return 'downloads';
+  }
   if (
     type.includes('pdf') ||
     type.includes('word') ||
@@ -21,15 +24,16 @@ export function categorizeFile(file: File): FileCategory {
     name.endsWith('.pdf') ||
     name.endsWith('.docx') ||
     name.endsWith('.xlsx') ||
-    name.endsWith('.pptx')
+    name.endsWith('.pptx') ||
+    name.endsWith('.md')
   ) {
     return 'documents';
   }
   return 'downloads';
 }
 
-export async function createKaydoFile(file: File): Promise<KaydoFile> {
-  const category = categorizeFile(file);
+export async function createKaydoFile(file: File, relativePath?: string): Promise<KaydoFile> {
+  const category = relativePath && relativePath.includes('/') ? 'folders' : categorizeFile(file);
   let thumbnail: string | undefined = undefined;
 
   if (file.type.startsWith('image/')) {
@@ -44,7 +48,8 @@ export async function createKaydoFile(file: File): Promise<KaydoFile> {
     category,
     date: new Date().toLocaleDateString(),
     thumbnail,
-    blob: file
+    blob: file,
+    relativePath: relativePath || (file as any).webkitRelativePath || file.name
   };
 }
 

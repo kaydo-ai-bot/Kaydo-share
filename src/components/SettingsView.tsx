@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Settings as SettingsIcon, ArrowLeft, Smartphone, Globe, Folder, Volume2, ShieldCheck, Check } from 'lucide-react';
+import { Settings as SettingsIcon, ArrowLeft, Smartphone, Globe, Folder, Volume2, ShieldCheck, Check, Sun, Moon, Radio } from 'lucide-react';
 import { AppSettings } from '../types';
 import { translations, LanguageKey } from '../i18n';
 
@@ -148,11 +148,90 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         </div>
 
+        {/* Theme Mode & Connection Technology */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {/* Theme Selector */}
+          <div className="bg-slate-900/60 border border-slate-800 rounded-3xl p-6 space-y-4">
+            <div className="flex items-center space-x-3">
+              <div className="w-10 h-10 rounded-xl bg-indigo-500/10 text-indigo-400 flex items-center justify-center">
+                <Sun className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-white">{t.themeMode || 'Mode Thème'}</h3>
+                <p className="text-xs text-slate-400">Basculer entre thème sombre et clair</p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <button
+                type="button"
+                onClick={() => updateSettings({ themeMode: 'dark' })}
+                className={`flex items-center justify-center space-x-2 py-2.5 rounded-2xl text-xs font-bold transition-all border ${
+                  settings.themeMode === 'dark'
+                    ? 'bg-blue-600 border-blue-500 text-white shadow-lg shadow-blue-600/30'
+                    : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                }`}
+              >
+                <Moon className="w-4 h-4" />
+                <span>{t.darkMode || 'Sombre'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => updateSettings({ themeMode: 'light' })}
+                className={`flex items-center justify-center space-x-2 py-2.5 rounded-2xl text-xs font-bold transition-all border ${
+                  settings.themeMode === 'light'
+                    ? 'bg-amber-500 border-amber-400 text-slate-950 shadow-lg shadow-amber-500/30'
+                    : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                }`}
+              >
+                <Sun className="w-4 h-4" />
+                <span>{t.lightMode || 'Clair'}</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Engine Selector */}
+          <div className="bg-slate-900/60 border border-slate-800 rounded-3xl p-6 space-y-4">
+            <div className="flex items-center space-x-3">
+              <div className="w-10 h-10 rounded-xl bg-cyan-500/10 text-cyan-400 flex items-center justify-center">
+                <Radio className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-white">{t.connectionMode || 'Moteur P2P'}</h3>
+                <p className="text-xs text-slate-400">Protocole de transport privilégié</p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                { id: 'auto', label: 'Automatique' },
+                { id: 'webrtc', label: 'WebRTC P2P' },
+                { id: 'hotspot', label: 'Hotspot :52222' },
+                { id: 'nearby', label: 'Google Nearby' }
+              ].map((tech) => (
+                <button
+                  key={tech.id}
+                  type="button"
+                  onClick={() => updateSettings({ preferredTechnology: tech.id as any })}
+                  className={`py-2 px-3 rounded-xl text-[11px] font-bold transition-all border ${
+                    settings.preferredTechnology === tech.id
+                      ? 'bg-cyan-600 border-cyan-500 text-white shadow-md'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                  }`}
+                >
+                  {tech.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
         {/* Future iOS Note */}
         <div className="bg-slate-950 border border-slate-800 rounded-3xl p-6 flex items-center space-x-4">
           <ShieldCheck className="w-8 h-8 text-blue-400 shrink-0" />
           <div className="space-y-1">
-            <h4 className="text-xs font-bold text-white uppercase tracking-wider">Compatibilité iOS Future</h4>
+            <h4 className="text-xs font-bold text-white uppercase tracking-wider">Interopérabilité Universelle</h4>
             <p className="text-xs text-slate-400">{t.futureIosNote}</p>
           </div>
         </div>
