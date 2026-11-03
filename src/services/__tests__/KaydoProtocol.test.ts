@@ -7,10 +7,50 @@ import {
   calculateSha256,
   FileAssemblyBuffer,
   ChecksumMismatchError,
-  FileManifest
+  FileManifest,
+  KAYDO_MAGIC,
+  KAYDO_VERSION,
+  KaydoMessageType,
+  Sha256Incremental,
+  calculateBlobSha256
 } from '../KaydoProtocol';
 
 describe('KAYDO Protocol - Binary Framing & Verification Suite', () => {
+
+  it('verifies exact wire format matching Android Kotlin and iOS Swift implementations', () => {
+    // Magic 'KYDO': 0x4B, 0x59, 0x44, 0x4F
+    expect(Array.from(KAYDO_MAGIC)).toEqual([0x4b, 0x59, 0x44, 0x4f]);
+    expect(KAYDO_VERSION).toBe(1);
+    expect(KaydoMessageType.FILE_CHUNK).toBe(0x04);
+    expect(KaydoMessageType.FILE_MANIFEST).toBe(0x03);
+
+    // Verify Big-Endian byte layout of encodeChunkFrame
+    const testPayload = new Uint8Array([0xaa, 0xbb]).buffer;
+    const frame = new Uint8Array(encodeChunkFrame('test', 1, 10, 65536, testPayload));
+
+    // Magic
+    expect(frame[0]).toBe(0x4b);
+    expect(frame[1]).toBe(0x59);
+    expect(frame[2]).toBe(0x44);
+    expect(frame[3]).toBe(0x4f);
+    // Version & Type
+    expect(frame[4]).toBe(1);
+    expect(frame[5]).toBe(0x04);
+
+    // ChunkIndex = 1 (UInt16 Big-Endian: [0x00, 0x01])
+    expect(frame[6]).toBe(0x00);
+    expect(frame[7]).toBe(0x01);
+
+    // TotalChunks = 10 (UInt16 Big-Endian: [0x00, 0x0a])
+    expect(frame[8]).toBe(0x00);
+    expect(frame[9]).toBe(0x0a);
+
+    // Offset = 65536 (UInt32 Big-Endian: [0x00, 0x01, 0x00, 0x00])
+    expect(frame[10]).toBe(0x00);
+    expect(frame[11]).toBe(0x01);
+    expect(frame[12]).toBe(0x00);
+    expect(frame[13]).toBe(0x00);
+  });
 
   it('correctly encodes and decodes a file manifest binary frame', () => {
     const manifest: FileManifest = {
@@ -51,50 +91,50 @@ describe('KAYDO Protocol - Binary Framing & Verification Suite', () => {
     expect(Array.from(decodedPayload)).toEqual([10, 20, 30, 40, 50, 60, 70, 80]);
   });
 
-  it('assembles chunks in order and verifies SHA-256 successfully', async () => {
-    // Create test binary data: 3 chunks of 10 bytes = 30 bytes
-    const originalData = new Uint8Array(30);
-    for (let i = 0; i < 30; i++) originalData[i] = i * 3;
+  it('handles 1 MB file chunking, reassembly, and cryptographic verification', async () => {
+    const oneMB = 1024 * 1024;
+    const data = new Uint8Array(oneMB);
+    for (let i = 0; i < oneMB; i++) {
+      data[i] = (i * 31) & 0xff;
+    }
 
-    const expectedSha256 = await calculateSha256(originalData.buffer);
+    const expectedSha256 = await calculateSha256(data.buffer);
+    const chunkSize = 64 * 1024; // 64 KB per chunk
+    const totalChunks = Math.ceil(oneMB / chunkSize);
 
     const manifest: FileManifest = {
-      fileId: 'file_order_test',
-      fileName: 'test_document.bin',
-      fileSize: 30,
+      fileId: 'file_1mb_test',
+      fileName: 'large_payload_1mb.bin',
+      fileSize: oneMB,
       mimeType: 'application/octet-stream',
       expectedSha256,
-      totalChunks: 3,
-      chunkSize: 10
+      totalChunks,
+      chunkSize
     };
 
     const assembly = new FileAssemblyBuffer(manifest);
 
-    // Chunk 0 (0..9)
-    assembly.addChunk(
-      { fileId: manifest.fileId, chunkIndex: 0, totalChunks: 3, offset: 0, payloadLength: 10 },
-      originalData.slice(0, 10).buffer
-    );
-    expect(assembly.getProgressPercentage()).toBe(33);
+    for (let i = 0; i < totalChunks; i++) {
+      const offset = i * chunkSize;
+      const end = Math.min(offset + chunkSize, oneMB);
+      const chunkBytes = data.slice(offset, end);
 
-    // Chunk 1 (10..19)
-    assembly.addChunk(
-      { fileId: manifest.fileId, chunkIndex: 1, totalChunks: 3, offset: 10, payloadLength: 10 },
-      originalData.slice(10, 20).buffer
-    );
-    expect(assembly.getProgressPercentage()).toBe(66);
+      const chunkFrame = encodeChunkFrame(
+        manifest.fileId,
+        i,
+        totalChunks,
+        offset,
+        chunkBytes.buffer
+      );
 
-    // Chunk 2 (20..29)
-    assembly.addChunk(
-      { fileId: manifest.fileId, chunkIndex: 2, totalChunks: 3, offset: 20, payloadLength: 10 },
-      originalData.slice(20, 30).buffer
-    );
+      const decoded = decodeChunkFrame(chunkFrame);
+      assembly.addChunk(decoded.header, decoded.payload);
+    }
+
     expect(assembly.isComplete()).toBe(true);
-    expect(assembly.getProgressPercentage()).toBe(100);
-
     const result = await assembly.finalize();
     expect(result.verifiedSha256).toBe(expectedSha256);
-    expect(result.blob.size).toBe(30);
+    expect(result.blob.size).toBe(oneMB);
   });
 
   it('correctly handles out-of-order chunk arrival without corrupting bytes', async () => {
@@ -176,8 +216,6 @@ describe('KAYDO Protocol - Binary Framing & Verification Suite', () => {
   });
 
   it('Sha256Incremental calculates identical hash to Web Crypto API across multiple chunk feeds', async () => {
-    const { Sha256Incremental, calculateBlobSha256 } = await import('../KaydoProtocol');
-
     // Create 100 KB test payload
     const testBytes = new Uint8Array(100 * 1024);
     for (let i = 0; i < testBytes.length; i++) {
@@ -186,7 +224,7 @@ describe('KAYDO Protocol - Binary Framing & Verification Suite', () => {
 
     const expectedHash = await calculateSha256(testBytes.buffer);
 
-    // Feed in 7-byte irregular slices to test internal 64-byte block boundary logic
+    // Feed in irregular slices to test internal 64-byte block boundary logic
     const incremental = new Sha256Incremental();
     const sliceSize = 777;
     for (let offset = 0; offset < testBytes.length; offset += sliceSize) {
@@ -204,4 +242,3 @@ describe('KAYDO Protocol - Binary Framing & Verification Suite', () => {
   });
 
 });
-

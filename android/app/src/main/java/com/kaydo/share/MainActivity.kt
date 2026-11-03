@@ -1,16 +1,22 @@
 package com.kaydo.share
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -18,10 +24,17 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import com.kaydo.share.transfer.DiscoveredEndpoint
 import com.kaydo.share.transfer.KaydoNearbyManager
+import com.kaydo.share.transfer.PendingConnectionRequest
+import com.kaydo.share.transfer.TransferHistoryItem
+import com.kaydo.share.transfer.TransferState
+import java.io.File
+import java.io.FileOutputStream
 
 class MainActivity : ComponentActivity() {
 
@@ -32,7 +45,11 @@ class MainActivity : ComponentActivity() {
     ) { permissions ->
         val allGranted = permissions.entries.all { it.value }
         if (!allGranted) {
-            Toast.makeText(this, "Permissions requises pour le partage hors-ligne", Toast.LENGTH_LONG).show()
+            Toast.makeText(
+                this,
+                "Certaines permissions sont requises pour le transfert hors-ligne direct",
+                Toast.LENGTH_LONG
+            ).show()
         }
     }
 
@@ -41,15 +58,16 @@ class MainActivity : ComponentActivity() {
         nearbyManager = KaydoNearbyManager(this)
         checkAndRequestPermissions()
 
+        val deviceName = "KAYDO-${Build.MANUFACTURER.uppercase()}-${Build.MODEL.replace(" ", "-")}"
+
         setContent {
             KaydoShareScreen(
                 nearbyManager = nearbyManager,
-                onSendClicked = {
-                    nearbyManager.startAdvertising("KAYDO-Android-${(100..999).random()}")
+                localDeviceName = deviceName,
+                onSelectFilesAndSend = { endpointId ->
+                    // Launcher handled inside Composable
                 },
-                onReceiveClicked = {
-                    nearbyManager.startDiscovery()
-                }
+                resolveUriToFile = { uri -> copyUriToCacheFile(this, uri) }
             )
         }
     }
@@ -86,98 +104,253 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         nearbyManager.stopAll()
     }
+
+    companion object {
+        fun copyUriToCacheFile(context: Context, uri: Uri): File? {
+            return try {
+                var fileName = "file_${System.currentTimeMillis()}"
+                context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (nameIndex != -1 && cursor.moveToFirst()) {
+                        fileName = cursor.getString(nameIndex)
+                    }
+                }
+
+                val cacheFile = File(context.cacheDir, fileName)
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(cacheFile).use { output ->
+                        val buffer = ByteArray(65536)
+                        var read: Int
+                        while (input.read(buffer).also { read = it } != -1) {
+                            output.write(buffer, 0, read)
+                        }
+                        output.flush()
+                    }
+                }
+                cacheFile
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
 }
 
 @Composable
 fun KaydoShareScreen(
     nearbyManager: KaydoNearbyManager,
-    onSendClicked: () -> Unit,
-    onReceiveClicked: () -> Unit
+    localDeviceName: String,
+    onSelectFilesAndSend: (String) -> Unit,
+    resolveUriToFile: (Uri) -> File?
 ) {
     val peers by nearbyManager.discoveredPeers.collectAsState()
     val connectedEndpoint by nearbyManager.connectedEndpoint.collectAsState()
+    val pendingConnection by nearbyManager.pendingConnection.collectAsState()
     val transferState by nearbyManager.transferProgress.collectAsState()
+    val history by nearbyManager.transferHistory.collectAsState()
 
     var activeMode by remember { mutableStateOf<String?>(null) }
+    var selectedFilesToSend by remember { mutableStateOf<List<File>>(emptyList()) }
+
+    // Véritable sélecteur de fichiers Android natif (Documents, Images, Vidéos, Audios, etc.)
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            val resolved = uris.mapNotNull { resolveUriToFile(it) }
+            selectedFilesToSend = resolved
+            activeMode = "send"
+            nearbyManager.startAdvertising(localDeviceName)
+
+            // Si déjà connecté, envoyer immédiatement
+            connectedEndpoint?.let { endpoint ->
+                resolved.forEach { file ->
+                    nearbyManager.sendFile(file, endpoint.id)
+                }
+            }
+        }
+    }
+
+    // Dialogue d'accord explicite avec code de sécurité (PIN)
+    pendingConnection?.let { pending ->
+        AlertDialog(
+            onDismissRequest = { nearbyManager.rejectConnection(pending.endpointId) },
+            containerColor = Color(0xFF0F172A),
+            title = {
+                Text(
+                    text = "Demande de connexion",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Column(spacing = 10.dp) {
+                    Text(
+                        text = "L'appareil '${pending.endpointName}' souhaite établir une connexion directe.",
+                        color = Color(0xFF94A3B8),
+                        fontSize = 13.sp
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Vérifiez que le code de sécurité affiché sur les deux téléphones est identique :",
+                        color = Color(0xFFCBD5E1),
+                        fontSize = 12.sp
+                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF1E293B), RoundedCornerShape(12.dp))
+                            .padding(12.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = pending.authDigits,
+                            color = Color(0xFF60A5FA),
+                            fontSize = 24.sp,
+                            fontWeight = FontWeight.Black,
+                            letterSpacing = 4.sp
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = { nearbyManager.acceptConnection(pending.endpointId) },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
+                ) {
+                    Text("Accepter")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = { nearbyManager.rejectConnection(pending.endpointId) },
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFEF4444))
+                ) {
+                    Text("Refuser")
+                }
+            }
+        )
+    }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFF07080F))
-            .padding(20.dp),
+            .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // Brand Header
-        Spacer(modifier = Modifier.height(30.dp))
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Branding
         Text(
             text = "KAYDO SHARE",
-            fontSize = 28.sp,
+            fontSize = 26.sp,
             fontWeight = FontWeight.Black,
             color = Color(0xFF60A5FA)
         )
         Text(
-            text = "Partage direct P2P 100% Hors-ligne (Android & iOS)",
+            text = "Partage direct P2P 100% Hors-ligne",
             fontSize = 12.sp,
             color = Color(0xFF94A3B8)
         )
+        Text(
+            text = "Appareil local: $localDeviceName",
+            fontSize = 11.sp,
+            color = Color(0xFF64748B)
+        )
 
-        Spacer(modifier = Modifier.height(40.dp))
+        Spacer(modifier = Modifier.height(24.dp))
 
-        // Two Main Action Cards: ENVOYER & RECEVOIR
+        // Deux Grandes Actions : ENVOYER & RECEVOIR
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(16.dp)
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // ENVOYER
+            // ENVOYER : Ouvre le vrai sélecteur de fichiers
             Card(
                 modifier = Modifier
                     .weight(1f)
-                    .height(140.dp)
+                    .height(115.dp)
                     .clickable {
-                        activeMode = "send"
-                        onSendClicked()
+                        filePickerLauncher.launch(arrayOf("*/*"))
                     },
-                shape = RoundedCornerShape(24.dp),
+                shape = RoundedCornerShape(20.dp),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A))
             ) {
                 Column(
-                    modifier = Modifier.fillMaxSize().padding(16.dp),
+                    modifier = Modifier.fillMaxSize().padding(12.dp),
                     verticalArrangement = Arrangement.Center,
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Text("ENVOYER", color = Color(0xFF60A5FA), fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                    Text("ENVOYER", color = Color(0xFF60A5FA), fontWeight = FontWeight.Bold, fontSize = 16.sp)
                     Spacer(modifier = Modifier.height(4.dp))
-                    Text("Mode Émetteur", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                    Text(
+                        text = if (selectedFilesToSend.isNotEmpty()) "${selectedFilesToSend.size} fichier(s) prêt(s)" else "Sélectionner fichiers",
+                        color = Color(0xFF94A3B8),
+                        fontSize = 11.sp
+                    )
                 }
             }
 
-            // RECEVOIR
+            // RECEVOIR : Active le mode découverte Nearby
             Card(
                 modifier = Modifier
                     .weight(1f)
-                    .height(140.dp)
+                    .height(115.dp)
                     .clickable {
                         activeMode = "receive"
-                        onReceiveClicked()
+                        nearbyManager.startDiscovery()
                     },
-                shape = RoundedCornerShape(24.dp),
+                shape = RoundedCornerShape(20.dp),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A))
             ) {
                 Column(
-                    modifier = Modifier.fillMaxSize().padding(16.dp),
+                    modifier = Modifier.fillMaxSize().padding(12.dp),
                     verticalArrangement = Arrangement.Center,
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Text("RECEVOIR", color = Color(0xFFA78BFA), fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                    Text("RECEVOIR", color = Color(0xFFA78BFA), fontWeight = FontWeight.Bold, fontSize = 16.sp)
                     Spacer(modifier = Modifier.height(4.dp))
                     Text("Mode Radar", color = Color(0xFF94A3B8), fontSize = 11.sp)
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(30.dp))
+        Spacer(modifier = Modifier.height(20.dp))
 
-        // Discovered Devices Section (Real, zero mock)
+        // État de connexion actuel
+        connectedEndpoint?.let { connected ->
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B))
+            ) {
+                Row(
+                    modifier = Modifier.padding(14.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text("Connecté à", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                        Text(connected.name, color = Color(0xFF10B981), fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    }
+                    if (selectedFilesToSend.isNotEmpty()) {
+                        Button(
+                            onClick = {
+                                selectedFilesToSend.forEach { file ->
+                                    nearbyManager.sendFile(file, connected.id)
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
+                        ) {
+                            Text("Transférer (${selectedFilesToSend.size})", fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+
+        // Section Appareils Détectés
         Text(
             text = "APPAREILS DÉTECTÉS (${peers.size})",
             fontSize = 12.sp,
@@ -186,18 +359,18 @@ fun KaydoShareScreen(
             modifier = Modifier.align(Alignment.Start)
         )
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
         if (peers.isEmpty()) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(120.dp)
-                    .background(Color(0xFF090D16), RoundedCornerShape(20.dp)),
+                    .height(90.dp)
+                    .background(Color(0xFF090D16), RoundedCornerShape(16.dp)),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = if (activeMode != null) "Recherche d'appareils réels à proximité..." else "Appuyez sur ENVOYER ou RECEVOIR pour démarrer.",
+                    text = if (activeMode != null) "Recherche d'appareils réels à proximité..." else "Appuyez sur ENVOYER ou RECEVOIR.",
                     color = Color(0xFF64748B),
                     fontSize = 12.sp
                 )
@@ -208,44 +381,139 @@ fun KaydoShareScreen(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .background(Color(0xFF0F172A), RoundedCornerShape(16.dp))
-                            .padding(16.dp),
+                            .background(Color(0xFF0F172A), RoundedCornerShape(14.dp))
+                            .padding(12.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column {
-                            Text(peer.name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                            Text("ID: ${peer.id}", color = Color(0xFF64748B), fontSize = 11.sp)
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = peer.name,
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text("Nearby Direct P2P", color = Color(0xFF64748B), fontSize = 11.sp)
                         }
                         Button(
-                            onClick = { nearbyManager.connectToEndpoint(peer.id, "KAYDO-Android") },
+                            onClick = { nearbyManager.requestConnection(peer, localDeviceName) },
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
                         ) {
-                            Text("Connecter", fontSize = 12.sp)
+                            Text("Connecter", fontSize = 11.sp)
                         }
                     }
                 }
             }
         }
 
-        // Active Transfer Banner
-        if (transferState.totalBytes > 0) {
-            Spacer(modifier = Modifier.height(24.dp))
+        // Carte Progression du Transfert
+        if (transferState.totalBytes > 0 || transferState.error != null) {
+            Spacer(modifier = Modifier.height(16.dp))
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(20.dp),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B))
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF131B2E))
             ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text("Transfert en cours...", color = Color.White, fontWeight = FontWeight.Bold)
-                    Spacer(modifier = Modifier.height(8.dp))
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Text(
+                        text = if (transferState.isComplete) "Transfert terminé !" else "Transfert en cours...",
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
+
+                    if (transferState.fileName.isNotBlank()) {
+                        Text(
+                            text = transferState.fileName,
+                            color = Color(0xFF94A3B8),
+                            fontSize = 12.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
                     LinearProgressIndicator(
                         progress = transferState.progress / 100f,
                         modifier = Modifier.fillMaxWidth(),
-                        color = Color(0xFF60A5FA)
+                        color = if (transferState.isComplete) Color(0xFF10B981) else Color(0xFF60A5FA)
                     )
+
                     Spacer(modifier = Modifier.height(4.dp))
-                    Text("${transferState.progress}% transféré - SHA-256 actif", color = Color(0xFF94A3B8), fontSize = 11.sp)
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("${transferState.progress}%", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                        if (transferState.speedMBs > 0.0) {
+                            Text(
+                                "%.2f Mo/s".format(transferState.speedMBs),
+                                color = Color(0xFF60A5FA),
+                                fontSize = 11.sp
+                            )
+                        }
+                        if (transferState.isVerified) {
+                            Text("SHA-256 Validé", color = Color(0xFF10B981), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    transferState.error?.let { err ->
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(err, color = Color(0xFFEF4444), fontSize = 11.sp)
+                    }
+                }
+            }
+        }
+
+        // Historique des transferts
+        if (history.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                text = "HISTORIQUE RÉCENT",
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFF64748B),
+                modifier = Modifier.align(Alignment.Start)
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                items(history) { item ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF0F172A), RoundedCornerShape(12.dp))
+                            .padding(10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = item.fileName,
+                                color = Color.White,
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = "${if (item.isReceived) "Reçu" else "Envoyé"} • ${item.fileSize / 1024} Ko",
+                                color = Color(0xFF64748B),
+                                fontSize = 10.sp
+                            )
+                        }
+                        Text(
+                            text = if (item.isSuccess) "SHA-256 OK" else "Échec",
+                            color = if (item.isSuccess) Color(0xFF10B981) else Color(0xFFEF4444),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                 }
             }
         }
