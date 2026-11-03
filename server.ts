@@ -11,87 +11,91 @@ interface PeerRecord {
   name: string;
   model: string;
   os: string;
-  rssi: number;
-  avatarColor: string;
   lastSeen: number;
-  roomId?: string;
+  localIp?: string;
+  port?: number;
 }
 
-interface SignalMessage {
+interface SignalEnvelope {
   id: string;
   fromId: string;
   toId: string;
-  type: string;
+  type: 'CONNECT_REQUEST' | 'CONNECT_ACCEPT' | 'CONNECT_REJECT' | 'WEBRTC_SIGNAL';
   payload: any;
   timestamp: number;
 }
 
-// In-memory registry of active devices & messages
-const peers = new Map<string, PeerRecord>();
-const messageQueue = new Map<string, SignalMessage[]>();
+// In-memory peer registry for local discovery signaling only (ZERO file payloads)
+const activePeers = new Map<string, PeerRecord>();
+const signalMailbox = new Map<string, SignalEnvelope[]>();
 
-// Cleanup inactive peers every 10 seconds
+// Cleanup stale peers (evict after 10s of silence)
 setInterval(() => {
   const now = Date.now();
-  for (const [id, peer] of peers.entries()) {
-    if (now - peer.lastSeen > 12000) {
-      peers.delete(id);
-      messageQueue.delete(id);
+  for (const [id, peer] of activePeers.entries()) {
+    if (now - peer.lastSeen > 10000) {
+      activePeers.delete(id);
+      signalMailbox.delete(id);
     }
   }
-}, 5000);
+}, 4000);
 
 async function startServer() {
   const app = express();
   const PORT = parseInt(process.env.PORT || '3000', 10);
 
-  app.use(express.json({ limit: '100mb' }));
+  // Strict payload limit: only lightweight signaling (SDP, ICE, Handshake).
+  // Strictly NO file chunk transport through the server!
+  app.use(express.json({ limit: '64kb' }));
 
-  // 1. Peer Discovery: Heartbeat & Announce
+  // 1. Peer Discovery: Heartbeat & Local Registration
   app.post('/api/discovery/heartbeat', (req, res) => {
-    const { id, name, model, os, avatarColor, roomId } = req.body;
-    if (!id) {
-      return res.status(400).json({ error: 'Missing device id' });
-    }
+    const { id, name, model, os, localIp, port } = req.body;
+    if (!id) return res.status(400).json({ error: 'Missing device id' });
 
-    peers.set(id, {
+    activePeers.set(id, {
       id,
       name: name || `KAYDO-${id.substring(0, 4)}`,
-      model: model || 'Appareil mobile',
+      model: model || 'Appareil',
       os: os || 'Android',
-      rssi: -40 - Math.floor(Math.random() * 20),
-      avatarColor: avatarColor || 'bg-blue-600',
       lastSeen: Date.now(),
-      roomId
+      localIp,
+      port
     });
 
     res.json({ success: true });
   });
 
-  // 2. Peer Discovery: List other active devices
+  // 2. Peer Discovery: Retrieve real active peers
   app.get('/api/discovery/peers', (req, res) => {
     const myId = req.query.myId as string;
     const now = Date.now();
-    const activePeers: PeerRecord[] = [];
+    const result: PeerRecord[] = [];
 
-    for (const [id, peer] of peers.entries()) {
-      if (id !== myId && now - peer.lastSeen <= 12000) {
-        activePeers.push(peer);
+    for (const [id, peer] of activePeers.entries()) {
+      if (id !== myId && now - peer.lastSeen <= 10000) {
+        result.push(peer);
       }
     }
 
-    res.json({ peers: activePeers });
+    res.json({ peers: result });
   });
 
-  // 3. Signaling: Send message to a target peer (e.g. connect request, pin verify, chunk, WebRTC SDP/ICE)
+  // 3. Signaling Relay: Strictly for WebRTC SDP / ICE or Hotspot coordination
+  // File data payloads are strictly rejected here.
   app.post('/api/signal/send', (req, res) => {
     const { fromId, toId, type, payload } = req.body;
-    if (!toId || !type) {
-      return res.status(400).json({ error: 'Missing toId or type' });
+    if (!toId || !type) return res.status(400).json({ error: 'Missing parameters' });
+
+    // Block any attempt to send file chunks through the server
+    if (type === 'FILE_CHUNK' || type === 'START_FILE' || type === 'FILE_COMPLETE') {
+      return res.status(403).json({
+        error: 'Interdit: Le transport de fichiers doit obligatoirement se faire en direct P2P (WebRTC ou Wi-Fi Direct/Socket local).'
+      });
     }
 
-    const msg: SignalMessage = {
-      id: `msg_${Date.now()}_${Math.random().toString(36).substring(7)}`,
+    const envelope: SignalEnvelope = {
+      id: `sig_${Date.now()}_${Math.random().toString(36).substring(7)}`,
       fromId,
       toId,
       type,
@@ -99,55 +103,26 @@ async function startServer() {
       timestamp: Date.now()
     };
 
-    if (!messageQueue.has(toId)) {
-      messageQueue.set(toId, []);
+    if (!signalMailbox.has(toId)) {
+      signalMailbox.set(toId, []);
     }
-    const q = messageQueue.get(toId)!;
-    q.push(msg);
+    const q = signalMailbox.get(toId)!;
+    q.push(envelope);
 
-    // Keep max 200 items in queue
-    if (q.length > 200) {
-      q.splice(0, q.length - 200);
-    }
+    if (q.length > 50) q.shift(); // Keep only recent signals
 
-    res.json({ success: true, messageId: msg.id });
+    res.json({ success: true, signalId: envelope.id });
   });
 
-  // 4. Signaling: Poll messages for my device
+  // 4. Signaling Poll: Retrieve WebRTC / Handshake messages
   app.get('/api/signal/messages', (req, res) => {
     const myId = req.query.myId as string;
-    if (!myId) {
-      return res.status(400).json({ error: 'Missing myId' });
-    }
+    if (!myId) return res.status(400).json({ error: 'Missing myId' });
 
-    const messages = messageQueue.get(myId) || [];
-    // Clear read messages
-    messageQueue.set(myId, []);
+    const messages = signalMailbox.get(myId) || [];
+    signalMailbox.set(myId, []);
 
     res.json({ messages });
-  });
-
-  // 5. Direct Chunk Relay: Guaranteed fallback transfer across different networks
-  app.post('/api/signal/chunk', (req, res) => {
-    const { toId, chunkMeta, chunkData } = req.body;
-    if (!toId) {
-      return res.status(400).json({ error: 'Missing toId' });
-    }
-
-    if (!messageQueue.has(toId)) {
-      messageQueue.set(toId, []);
-    }
-    const q = messageQueue.get(toId)!;
-    q.push({
-      id: `chk_${Date.now()}_${Math.random().toString(36).substring(7)}`,
-      fromId: req.body.fromId,
-      toId,
-      type: 'FILE_CHUNK',
-      payload: { chunkMeta, chunkData },
-      timestamp: Date.now()
-    });
-
-    res.json({ success: true });
   });
 
   // Mount Vite middleware in development
@@ -158,7 +133,6 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    // In production, serve dist folder
     app.use(express.static(path.resolve(__dirname, 'dist')));
     app.get('*', (_req, res) => {
       res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
@@ -166,11 +140,11 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[KAYDO SHARE] Real-time P2P Signaling Server running on port ${PORT}`);
+    console.log(`[KAYDO SHARE] Pure P2P Signaling & App Server listening on port ${PORT}`);
   });
 }
 
 startServer().catch((err) => {
-  console.error("Failed to start KAYDO SHARE server:", err);
+  console.error("Server startup error:", err);
   process.exit(1);
 });

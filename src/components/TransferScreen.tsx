@@ -287,14 +287,25 @@ export const TransferScreen: React.FC<TransferScreenProps> = ({
           {status === 'transferring' ? (
             <>
               <button
-                onClick={() => setIsPaused(!isPaused)}
+                onClick={() => {
+                  if (isPaused) {
+                    manager.resumeTransfer();
+                    setIsPaused(false);
+                  } else {
+                    manager.pauseTransfer();
+                    setIsPaused(true);
+                  }
+                }}
                 className="flex-1 bg-slate-800 hover:bg-slate-700 text-white font-bold py-3 px-6 rounded-2xl text-xs flex items-center justify-center space-x-2 transition-colors"
               >
                 {isPaused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
                 <span>{isPaused ? 'Reprendre' : 'Pause'}</span>
               </button>
               <button
-                onClick={() => setStatus('cancelled')}
+                onClick={() => {
+                  manager.cancelTransfer();
+                  setStatus('cancelled');
+                }}
                 className="flex-1 bg-rose-600/20 hover:bg-rose-600/30 text-rose-400 border border-rose-500/30 font-bold py-3 px-6 rounded-2xl text-xs transition-colors"
               >
                 {t.cancel}

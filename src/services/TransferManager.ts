@@ -1,11 +1,27 @@
 /**
  * TransferManager.ts
- * Real Cross-Device Peer-to-Peer Transfer Engine.
- * Supports discovery & connection across distinct physical phones, tablets and PCs.
- * Uses HTTP polling signaling relay (/api/discovery and /api/signal) + BroadcastChannel for same-device tabs.
+ * Pure Direct Peer-to-Peer (P2P) Engine for KAYDO SHARE.
+ *
+ * Rules:
+ * - ZERO file payloads are relayed through any server.
+ * - Files are transmitted directly device-to-device via WebRTC RTCDataChannel (binary ArrayBuffer).
+ * - Implements KaydoProtocol binary framing & strict SHA-256 validation.
+ * - Handles pause, cancellation, and corrupt file rejection.
+ * - Real metrics only: no fake RSSI or simulated speeds.
  */
 
 import { KaydoFile, NearbyDevice, TransferTask } from '../types';
+import {
+  FileManifest,
+  FileAssemblyBuffer,
+  encodeManifestFrame,
+  decodeManifestFrame,
+  encodeChunkFrame,
+  decodeChunkFrame,
+  calculateSha256,
+  KaydoMessageType,
+  KAYDO_MAGIC
+} from './KaydoProtocol';
 
 export type ConnectionState = 'disconnected' | 'advertising' | 'discovering' | 'connecting' | 'connected' | 'error';
 
@@ -19,6 +35,13 @@ export interface TransferListener {
   onError?: (error: string) => void;
 }
 
+const RTC_CONFIG: RTCConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' }
+  ]
+};
+
 export class TransferManager {
   private static instance: TransferManager;
   private state: ConnectionState = 'disconnected';
@@ -28,36 +51,32 @@ export class TransferManager {
   private connectedPeer: NearbyDevice | null = null;
   private currentPin: string = '';
 
+  // WebRTC P2P direct connection
+  private peerConnection: RTCPeerConnection | null = null;
+  private dataChannel: RTCDataChannel | null = null;
+  private isInitiator: boolean = false;
+
   private heartbeatTimer: number | null = null;
   private signalPollTimer: number | null = null;
   private peerPollTimer: number | null = null;
 
-  // Assembly buffer for incoming files
-  private incomingFileMeta: {
-    id: string;
-    name: string;
-    size: number;
-    type: string;
-    checksum: string;
-    totalChunks: number;
-    receivedChunks: BlobPart[];
-    bytesReceived: number;
-    startTime: number;
-  } | null = null;
+  // Active incoming file assembly buffer
+  private currentAssembly: FileAssemblyBuffer | null = null;
+  private isCancelled: boolean = false;
+  private isPaused: boolean = false;
 
   private constructor() {
     let deviceId = localStorage.getItem('kaydo_device_id');
     if (!deviceId) {
-      deviceId = `dev_${Math.random().toString(36).substring(2, 8)}`;
+      deviceId = `dev_${Math.random().toString(36).substring(2, 9)}`;
       localStorage.setItem('kaydo_device_id', deviceId);
     }
 
     let deviceName = localStorage.getItem('kaydo_device_name');
     if (!deviceName) {
-      const isMobile = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
       const isAndroid = /Android/i.test(navigator.userAgent);
       const isIOS = /iPhone|iPad/i.test(navigator.userAgent);
-      const prefix = isAndroid ? 'KAYDO-Android' : isIOS ? 'KAYDO-iPhone' : 'KAYDO-PC';
+      const prefix = isAndroid ? 'KAYDO-Android' : isIOS ? 'KAYDO-iPhone' : 'KAYDO-Web';
       deviceName = `${prefix}-${Math.floor(100 + Math.random() * 900)}`;
       localStorage.setItem('kaydo_device_name', deviceName);
     }
@@ -68,13 +87,13 @@ export class TransferManager {
     this.localDevice = {
       id: deviceId,
       name: deviceName,
-      model: isAndroid ? 'Téléphone Android' : isIOS ? 'iPhone iOS' : 'Ordinateur',
+      model: isAndroid ? 'Android Device' : isIOS ? 'Apple iPhone' : 'PC / Mac',
       os: isAndroid ? 'Android' : isIOS ? 'iOS' : 'Windows',
-      rssi: -45,
+      rssi: 0, // No fake RSSI
       avatarColor: 'bg-blue-600'
     };
 
-    this.startGlobalSignaling();
+    this.startDiscoverySignaling();
   }
 
   public static getInstance(): TransferManager {
@@ -98,19 +117,16 @@ export class TransferManager {
     this.listener = listener;
   }
 
-  private startGlobalSignaling() {
-    // Send immediate heartbeat
+  private startDiscoverySignaling() {
     this.sendHeartbeat();
 
-    // Heartbeat every 2.5 seconds so other phones always see us online
     this.heartbeatTimer = window.setInterval(() => {
       this.sendHeartbeat();
     }, 2500);
 
-    // Poll for signals (connection requests, answers, file chunks) every 400ms
     this.signalPollTimer = window.setInterval(() => {
-      this.pollSignalMessages();
-    }, 400);
+      this.pollSignalingMessages();
+    }, 500);
   }
 
   private async sendHeartbeat() {
@@ -122,16 +138,15 @@ export class TransferManager {
           id: this.localDevice.id,
           name: this.localDevice.name,
           model: this.localDevice.model,
-          os: this.localDevice.os,
-          avatarColor: this.localDevice.avatarColor
+          os: this.localDevice.os
         })
       });
-    } catch (e) {
-      // offline or network hiccup
+    } catch {
+      // offline / local network
     }
   }
 
-  private async pollSignalMessages() {
+  private async pollSignalingMessages() {
     try {
       const res = await fetch(`/api/signal/messages?myId=${encodeURIComponent(this.localDevice.id)}`);
       if (!res.ok) return;
@@ -139,10 +154,10 @@ export class TransferManager {
       if (!data.messages || data.messages.length === 0) return;
 
       for (const msg of data.messages) {
-        this.handleIncomingSignal(msg);
+        await this.handleIncomingSignal(msg);
       }
-    } catch (e) {
-      // transient network error
+    } catch {
+      // network hiccup
     }
   }
 
@@ -151,104 +166,249 @@ export class TransferManager {
 
     if (type === 'CONNECT_REQUEST') {
       const senderDevice: NearbyDevice = payload.sender;
-      this.currentPin = payload.pin || '4829';
+      this.currentPin = payload.pin;
       this.connectedPeer = senderDevice;
       this.listener?.onIncomingConnectionRequest?.(senderDevice, this.currentPin);
     } else if (type === 'CONNECT_ACCEPT') {
       const peerDevice: NearbyDevice = payload.sender;
       this.connectedPeer = peerDevice;
-      this.state = 'connected';
       this.currentPin = payload.pin || this.currentPin;
-      this.listener?.onConnectionEstablished?.(peerDevice, this.currentPin);
+      // Receiver accepted connection request. If initiator, setup WebRTC offer.
+      if (this.isInitiator) {
+        await this.initiateWebRtcConnection();
+      }
     } else if (type === 'CONNECT_REJECT') {
+      this.cleanupRtc();
       this.connectedPeer = null;
       this.state = 'disconnected';
       this.listener?.onConnectionRejected?.();
-    } else if (type === 'START_FILE') {
-      this.incomingFileMeta = {
-        id: payload.id,
-        name: payload.name,
-        size: payload.size,
-        type: payload.mimeType,
-        checksum: payload.checksum,
-        totalChunks: payload.totalChunks,
-        receivedChunks: [],
-        bytesReceived: 0,
-        startTime: Date.now()
-      };
-    } else if (type === 'FILE_CHUNK' && this.incomingFileMeta && this.incomingFileMeta.id === payload.id) {
-      // Decode Base64 chunk
-      const binaryString = atob(payload.chunkBase64);
-      const len = binaryString.length;
-      const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
+    } else if (type === 'WEBRTC_SIGNAL') {
+      await this.handleWebRtcSignal(payload);
+    }
+  }
+
+  // --- WebRTC Peer-to-Peer Direct Engine ---
+
+  private async createPeerConnection() {
+    this.cleanupRtc();
+    this.peerConnection = new RTCPeerConnection(RTC_CONFIG);
+
+    this.peerConnection.onicecandidate = (event) => {
+      if (event.candidate && this.connectedPeer) {
+        this.sendSignal('WEBRTC_SIGNAL', {
+          candidate: event.candidate
+        });
       }
+    };
 
-      this.incomingFileMeta.receivedChunks.push(bytes);
-      this.incomingFileMeta.bytesReceived += bytes.byteLength;
+    this.peerConnection.onconnectionstatechange = () => {
+      const state = this.peerConnection?.connectionState;
+      if (state === 'connected') {
+        this.state = 'connected';
+        if (this.connectedPeer) {
+          this.listener?.onConnectionEstablished?.(this.connectedPeer, this.currentPin);
+        }
+      } else if (state === 'failed' || state === 'closed') {
+        this.state = 'disconnected';
+      }
+    };
 
-      const elapsed = (Date.now() - this.incomingFileMeta.startTime) / 1000;
-      const speedMBs = elapsed > 0 ? (this.incomingFileMeta.bytesReceived / (1024 * 1024)) / elapsed : 0;
-      const progress = Math.min(100, Math.floor((this.incomingFileMeta.bytesReceived / this.incomingFileMeta.size) * 100));
+    this.peerConnection.ondatachannel = (event) => {
+      this.setupDataChannel(event.channel);
+    };
+  }
+
+  private setupDataChannel(channel: RTCDataChannel) {
+    this.dataChannel = channel;
+    this.dataChannel.binaryType = 'arraybuffer';
+
+    this.dataChannel.onopen = () => {
+      this.state = 'connected';
+      if (this.connectedPeer) {
+        this.listener?.onConnectionEstablished?.(this.connectedPeer, this.currentPin);
+      }
+    };
+
+    this.dataChannel.onmessage = async (event) => {
+      await this.handleDataChannelMessage(event.data);
+    };
+
+    this.dataChannel.onerror = (err) => {
+      console.warn("RTCDataChannel error:", err);
+    };
+  }
+
+  private async initiateWebRtcConnection() {
+    await this.createPeerConnection();
+    if (!this.peerConnection) return;
+
+    // Initiator creates the binary RTCDataChannel
+    const channel = this.peerConnection.createDataChannel('kaydo_transfer_channel', {
+      ordered: true
+    });
+    this.setupDataChannel(channel);
+
+    const offer = await this.peerConnection.createOffer();
+    await this.peerConnection.setLocalDescription(offer);
+
+    this.sendSignal('WEBRTC_SIGNAL', { sdp: offer });
+  }
+
+  private async handleWebRtcSignal(payload: any) {
+    if (payload.sdp) {
+      if (!this.peerConnection) {
+        await this.createPeerConnection();
+      }
+      if (!this.peerConnection) return;
+
+      await this.peerConnection.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+
+      if (payload.sdp.type === 'offer') {
+        const answer = await this.peerConnection.createAnswer();
+        await this.peerConnection.setLocalDescription(answer);
+        this.sendSignal('WEBRTC_SIGNAL', { sdp: answer });
+      }
+    } else if (payload.candidate) {
+      if (this.peerConnection && this.peerConnection.remoteDescription) {
+        await this.peerConnection.addIceCandidate(new RTCIceCandidate(payload.candidate));
+      }
+    }
+  }
+
+  private sendSignal(type: any, payload: any) {
+    if (!this.connectedPeer) return;
+    fetch('/api/signal/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fromId: this.localDevice.id,
+        toId: this.connectedPeer.id,
+        type,
+        payload
+      })
+    }).catch(() => {});
+  }
+
+  /**
+   * Processes incoming binary frames received directly from the remote peer's RTCDataChannel.
+   * STRICT: Validates Magic bytes, decodes chunks, and triggers SHA-256 verification.
+   */
+  private async handleDataChannelMessage(data: ArrayBuffer) {
+    const uint8 = new Uint8Array(data);
+    if (uint8.length < 6) return;
+
+    // Check magic bytes
+    if (
+      uint8[0] !== KAYDO_MAGIC[0] ||
+      uint8[1] !== KAYDO_MAGIC[1] ||
+      uint8[2] !== KAYDO_MAGIC[2] ||
+      uint8[3] !== KAYDO_MAGIC[3]
+    ) {
+      console.warn("Frame invalide: Magic bytes manquants");
+      return;
+    }
+
+    const type = uint8[5];
+
+    if (type === KaydoMessageType.FILE_MANIFEST) {
+      const manifest = decodeManifestFrame(data);
+      this.currentAssembly = new FileAssemblyBuffer(manifest);
 
       this.listener?.onTransferProgress?.({
-        id: this.incomingFileMeta.id,
-        fileName: this.incomingFileMeta.name,
-        fileSize: this.incomingFileMeta.size,
-        transferredBytes: this.incomingFileMeta.bytesReceived,
+        id: manifest.fileId,
+        fileName: manifest.fileName,
+        fileSize: manifest.fileSize,
+        transferredBytes: 0,
+        speedMBs: 0,
+        progress: 0,
+        status: 'transferring',
+        direction: 'receive',
+        peerName: this.connectedPeer?.name || 'Émetteur',
+        startTime: Date.now()
+      });
+    } else if (type === KaydoMessageType.FILE_CHUNK && this.currentAssembly) {
+      const { header, payload } = decodeChunkFrame(data);
+      this.currentAssembly.addChunk(header, payload);
+
+      const elapsed = (Date.now() - this.currentAssembly.startTime) / 1000;
+      const speedMBs = elapsed > 0 ? (this.currentAssembly.bytesReceived / (1024 * 1024)) / elapsed : 0;
+      const progress = this.currentAssembly.getProgressPercentage();
+
+      this.listener?.onTransferProgress?.({
+        id: this.currentAssembly.manifest.fileId,
+        fileName: this.currentAssembly.manifest.fileName,
+        fileSize: this.currentAssembly.manifest.fileSize,
+        transferredBytes: this.currentAssembly.bytesReceived,
         speedMBs: parseFloat(speedMBs.toFixed(2)),
         progress,
         status: 'transferring',
         direction: 'receive',
         peerName: this.connectedPeer?.name || 'Émetteur',
-        startTime: this.incomingFileMeta.startTime
-      });
-    } else if (type === 'FILE_COMPLETE' && this.incomingFileMeta && this.incomingFileMeta.id === payload.id) {
-      const parts = this.incomingFileMeta.receivedChunks;
-      const completeBlob = new Blob(parts, { type: this.incomingFileMeta.type });
-      const arrayBuffer = await completeBlob.arrayBuffer();
-
-      // Real SHA-256 verification
-      const hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
-      const hashArray = Array.from(new Uint8Array(hashBuffer));
-      const calculatedHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-
-      const isIntegrityValid = calculatedHash === this.incomingFileMeta.checksum;
-
-      const receivedKaydoFile: KaydoFile = {
-        id: this.incomingFileMeta.id,
-        name: this.incomingFileMeta.name,
-        size: this.incomingFileMeta.size,
-        type: this.incomingFileMeta.type,
-        category: this.getCategoryFromType(this.incomingFileMeta.name, this.incomingFileMeta.type),
-        date: new Date().toLocaleDateString(),
-        blob: completeBlob,
-        thumbnail: this.incomingFileMeta.type.startsWith('image/') ? URL.createObjectURL(completeBlob) : undefined
-      };
-
-      const elapsed = (Date.now() - this.incomingFileMeta.startTime) / 1000;
-      const finalSpeed = elapsed > 0 ? (this.incomingFileMeta.size / (1024 * 1024)) / elapsed : 0;
-
-      this.listener?.onTransferProgress?.({
-        id: this.incomingFileMeta.id,
-        fileName: this.incomingFileMeta.name,
-        fileSize: this.incomingFileMeta.size,
-        transferredBytes: this.incomingFileMeta.size,
-        speedMBs: parseFloat(finalSpeed.toFixed(2)),
-        progress: 100,
-        status: isIntegrityValid ? 'completed' : 'error',
-        direction: 'receive',
-        peerName: this.connectedPeer?.name || 'Émetteur',
-        startTime: this.incomingFileMeta.startTime,
-        checksum: calculatedHash,
-        error: isIntegrityValid ? undefined : "Échec de vérification SHA-256"
+        startTime: this.currentAssembly.startTime
       });
 
-      this.listener?.onFileReceived?.(receivedKaydoFile, completeBlob);
-      this.incomingFileMeta = null;
+      // If all chunks arrived, finalize with STRICT SHA-256 validation
+      if (this.currentAssembly.isComplete()) {
+        const assembly = this.currentAssembly;
+        try {
+          const { blob, verifiedSha256 } = await assembly.finalize();
+
+          const receivedFile: KaydoFile = {
+            id: assembly.manifest.fileId,
+            name: assembly.manifest.fileName,
+            size: assembly.manifest.fileSize,
+            type: assembly.manifest.mimeType,
+            category: this.getCategoryFromType(assembly.manifest.fileName, assembly.manifest.mimeType),
+            date: new Date().toLocaleDateString(),
+            blob,
+            thumbnail: assembly.manifest.mimeType.startsWith('image/') ? URL.createObjectURL(blob) : undefined
+          };
+
+          const totalTime = (Date.now() - assembly.startTime) / 1000;
+          const finalSpeed = totalTime > 0 ? (assembly.manifest.fileSize / (1024 * 1024)) / totalTime : 0;
+
+          this.listener?.onTransferProgress?.({
+            id: receivedFile.id,
+            fileName: receivedFile.name,
+            fileSize: receivedFile.size,
+            transferredBytes: receivedFile.size,
+            speedMBs: parseFloat(finalSpeed.toFixed(2)),
+            progress: 100,
+            status: 'completed',
+            direction: 'receive',
+            peerName: this.connectedPeer?.name || 'Émetteur',
+            startTime: assembly.startTime,
+            checksum: verifiedSha256
+          });
+
+          // Deliver ONLY after cryptographic hash has been 100% verified!
+          this.listener?.onFileReceived?.(receivedFile, blob);
+          this.currentAssembly = null;
+        } catch (err: any) {
+          // Checksum mismatch or corruption: strictly reject!
+          this.listener?.onTransferProgress?.({
+            id: assembly.manifest.fileId,
+            fileName: assembly.manifest.fileName,
+            fileSize: assembly.manifest.fileSize,
+            transferredBytes: assembly.bytesReceived,
+            speedMBs: 0,
+            progress: 100,
+            status: 'error',
+            direction: 'receive',
+            peerName: this.connectedPeer?.name || 'Émetteur',
+            startTime: assembly.startTime,
+            error: err.message || "Échec de validation SHA-256: Fichier corrompu rejeté."
+          });
+          this.currentAssembly = null;
+        }
+      }
+    } else if (type === KaydoMessageType.TRANSFER_CANCEL) {
+      this.currentAssembly = null;
+      this.listener?.onError?.("Le transfert a été annulé par l'appareil distant.");
     }
   }
+
+  // --- Discovery Public Methods ---
 
   public async fetchPeers() {
     try {
@@ -258,12 +418,15 @@ export class TransferManager {
       if (Array.isArray(data.peers)) {
         this.discoveredPeers.clear();
         for (const peer of data.peers) {
-          this.discoveredPeers.set(peer.id, peer);
+          this.discoveredPeers.set(peer.id, {
+            ...peer,
+            rssi: 0 // Zero fake RSSI
+          });
         }
         this.listener?.onPeersUpdated?.(Array.from(this.discoveredPeers.values()));
       }
-    } catch (e) {
-      // network error
+    } catch {
+      // offline
     }
   }
 
@@ -300,24 +463,14 @@ export class TransferManager {
   public requestConnect(targetDevice: NearbyDevice): string {
     this.state = 'connecting';
     this.connectedPeer = targetDevice;
+    this.isInitiator = true;
 
-    // Generate random 4-digit code for this pair
     const pin = Math.floor(1000 + Math.random() * 9000).toString();
     this.currentPin = pin;
 
-    // Send real signal to target device across the network
-    fetch('/api/signal/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        fromId: this.localDevice.id,
-        toId: targetDevice.id,
-        type: 'CONNECT_REQUEST',
-        payload: {
-          sender: this.localDevice,
-          pin
-        }
-      })
+    this.sendSignal('CONNECT_REQUEST', {
+      sender: this.localDevice,
+      pin
     });
 
     return pin;
@@ -326,37 +479,21 @@ export class TransferManager {
   public acceptConnection(targetDevice: NearbyDevice) {
     this.state = 'connected';
     this.connectedPeer = targetDevice;
+    this.isInitiator = false;
 
-    fetch('/api/signal/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        fromId: this.localDevice.id,
-        toId: targetDevice.id,
-        type: 'CONNECT_ACCEPT',
-        payload: {
-          sender: this.localDevice,
-          pin: this.currentPin
-        }
-      })
+    this.sendSignal('CONNECT_ACCEPT', {
+      sender: this.localDevice,
+      pin: this.currentPin
     });
 
     this.listener?.onConnectionEstablished?.(targetDevice, this.currentPin);
   }
 
   public rejectConnection(targetDevice: NearbyDevice) {
-    fetch('/api/signal/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        fromId: this.localDevice.id,
-        toId: targetDevice.id,
-        type: 'CONNECT_REJECT',
-        payload: {
-          sender: this.localDevice
-        }
-      })
+    this.sendSignal('CONNECT_REJECT', {
+      sender: this.localDevice
     });
+    this.cleanupRtc();
     this.connectedPeer = null;
   }
 
@@ -368,88 +505,103 @@ export class TransferManager {
     return this.connectedPeer;
   }
 
+  public pauseTransfer() {
+    this.isPaused = true;
+  }
+
+  public resumeTransfer() {
+    this.isPaused = false;
+  }
+
+  public cancelTransfer() {
+    this.isCancelled = true;
+    if (this.dataChannel && this.dataChannel.readyState === 'open') {
+      const buffer = new ArrayBuffer(6);
+      const uint8 = new Uint8Array(buffer);
+      uint8.set(KAYDO_MAGIC, 0);
+      uint8[4] = 1;
+      uint8[5] = KaydoMessageType.TRANSFER_CANCEL;
+      this.dataChannel.send(buffer);
+    }
+  }
+
   /**
-   * Real File Transfer:
-   * Slices actual Blob into binary chunks, converts to Base64, computes SHA-256,
-   * streams across the network to target peer.
+   * Sends files directly to the remote peer via RTCDataChannel.
+   * ZERO file chunks pass through any server.
    */
   public async sendFiles(files: KaydoFile[], onProgress: (task: TransferTask) => void) {
-    if (!this.connectedPeer) {
-      throw new Error("Aucun appareil connecté. Établissez d'abord une connexion.");
+    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+      throw new Error("Canal P2P direct non ouvert. Établissez d'abord la connexion WebRTC avec l'autre appareil.");
     }
 
-    const targetId = this.connectedPeer.id;
-    const chunkSize = 32 * 1024; // 32 KB chunks for reliable mobile network delivery
+    this.isCancelled = false;
+    this.isPaused = false;
+    const chunkSize = 64 * 1024; // 64 KB raw binary chunks
 
     for (const file of files) {
       if (!file.blob) {
         throw new Error(`Le fichier "${file.name}" ne contient pas de données binaires réelles.`);
       }
 
+      if (this.isCancelled) break;
+
       const totalSize = file.size;
       const totalChunks = Math.ceil(totalSize / chunkSize);
 
-      // Compute actual SHA-256 hash
+      // Compute actual SHA-256 before sending
       const wholeBuffer = await file.blob.arrayBuffer();
-      const hashBuffer = await crypto.subtle.digest('SHA-256', wholeBuffer);
-      const hashArray = Array.from(new Uint8Array(hashBuffer));
-      const checksum = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+      const expectedSha256 = await calculateSha256(wholeBuffer);
 
-      // Send START_FILE metadata
-      await fetch('/api/signal/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fromId: this.localDevice.id,
-          toId: targetId,
-          type: 'START_FILE',
-          payload: {
-            id: file.id,
-            name: file.name,
-            size: totalSize,
-            mimeType: file.type,
-            checksum,
-            totalChunks
-          }
-        })
-      });
+      const manifest: FileManifest = {
+        fileId: file.id,
+        fileName: file.name,
+        fileSize: totalSize,
+        mimeType: file.type || 'application/octet-stream',
+        expectedSha256,
+        totalChunks,
+        chunkSize
+      };
 
-      const startTime = Date.now();
+      // Send Manifest Frame directly over DataChannel
+      const manifestFrame = encodeManifestFrame(manifest);
+      this.dataChannel.send(manifestFrame);
+
+      const startTime = performance.now();
       let bytesSent = 0;
 
       for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+        if (this.isCancelled) {
+          throw new Error("Transfert annulé par l'utilisateur.");
+        }
+
+        // Wait if paused
+        while (this.isPaused && !this.isCancelled) {
+          await new Promise(r => setTimeout(r, 200));
+        }
+
         const start = chunkIndex * chunkSize;
         const end = Math.min(totalSize, start + chunkSize);
         const slice = file.blob.slice(start, end);
-        const chunkBuffer = await slice.arrayBuffer();
-        const bytes = new Uint8Array(chunkBuffer);
+        const chunkData = await slice.arrayBuffer();
 
-        // Convert binary chunk to base64
-        let binary = '';
-        for (let i = 0; i < bytes.byteLength; i++) {
-          binary += String.fromCharCode(bytes[i]);
+        const chunkFrame = encodeChunkFrame(
+          file.id,
+          chunkIndex,
+          totalChunks,
+          start,
+          chunkData
+        );
+
+        // Flow control: wait if RTCDataChannel buffer is full
+        if (this.dataChannel.bufferedAmount > 4 * 1024 * 1024) {
+          await new Promise(r => setTimeout(r, 50));
         }
-        const chunkBase64 = btoa(binary);
 
-        await fetch('/api/signal/send', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            fromId: this.localDevice.id,
-            toId: targetId,
-            type: 'FILE_CHUNK',
-            payload: {
-              id: file.id,
-              chunkIndex,
-              chunkBase64
-            }
-          })
-        });
+        this.dataChannel.send(chunkFrame);
+        bytesSent += chunkData.byteLength;
 
-        bytesSent += chunkBuffer.byteLength;
-
-        const elapsed = (Date.now() - startTime) / 1000;
-        const speedMBs = elapsed > 0 ? (bytesSent / (1024 * 1024)) / elapsed : 0;
+        const elapsedSeconds = (performance.now() - startTime) / 1000;
+        const speedMBs = elapsedSeconds > 0 ? (bytesSent / (1024 * 1024)) / elapsedSeconds : 0;
         const progress = Math.min(100, Math.floor((bytesSent / totalSize) * 100));
 
         onProgress({
@@ -461,31 +613,17 @@ export class TransferManager {
           progress,
           status: 'transferring',
           direction: 'send',
-          peerName: this.connectedPeer.name,
-          startTime,
-          checksum
+          peerName: this.connectedPeer?.name || 'Destinataire',
+          startTime: Math.floor(startTime),
+          checksum: expectedSha256
         });
 
-        // Small delay to prevent network congestion
-        await new Promise(r => setTimeout(r, 20));
+        // Small yield to allow event loop processing
+        await new Promise(r => setTimeout(r, 5));
       }
 
-      // Send completion message
-      await fetch('/api/signal/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fromId: this.localDevice.id,
-          toId: targetId,
-          type: 'FILE_COMPLETE',
-          payload: {
-            id: file.id
-          }
-        })
-      });
-
-      const totalTime = (Date.now() - startTime) / 1000;
-      const finalSpeed = totalTime > 0 ? (totalSize / (1024 * 1024)) / totalTime : 0;
+      const totalTimeSeconds = (performance.now() - startTime) / 1000;
+      const finalSpeed = totalTimeSeconds > 0 ? (totalSize / (1024 * 1024)) / totalTimeSeconds : 0;
 
       onProgress({
         id: file.id,
@@ -496,10 +634,21 @@ export class TransferManager {
         progress: 100,
         status: 'completed',
         direction: 'send',
-        peerName: this.connectedPeer.name,
-        startTime,
-        checksum
+        peerName: this.connectedPeer?.name || 'Destinataire',
+        startTime: Math.floor(startTime),
+        checksum: expectedSha256
       });
+    }
+  }
+
+  private cleanupRtc() {
+    if (this.dataChannel) {
+      try { this.dataChannel.close(); } catch {}
+      this.dataChannel = null;
+    }
+    if (this.peerConnection) {
+      try { this.peerConnection.close(); } catch {}
+      this.peerConnection = null;
     }
   }
 
